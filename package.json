@@ -1,0 +1,54 @@
+{
+  "name": "beverage-pos",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Beverage Sales & POS Management System for Pakistan Market",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:pos\" \"npm run dev:admin\"",
+    "dev:server": "npm run dev --workspace=server",
+    "dev:pos": "npm run dev --workspace=apps/pos",
+    "dev:admin": "npm run dev --workspace=apps/admin",
+    "build": "npm run build --workspaces --if-present",
+    "build:server": "npm run build --workspace=server",
+    "build:pos": "npm run build --workspace=apps/pos",
+    "build:admin": "npm run build --workspace=apps/admin",
+    "test": "npm run test --workspaces --if-present",
+    "test:server": "npm run test --workspace=server",
+    "lint": "npm run lint --workspaces --if-present",
+    "type-check": "npm run type-check --workspaces --if-present",
+    "db:migrate": "npm run db:migrate --workspace=server",
+    "db:seed": "npm run db:seed --workspace=server",
+    "db:studio": "npm run db:studio --workspace=server",
+    "db:setup": "npm run db:migrate && npm run db:seed"
+  },
+  "keywords": [
+    "pos",
+    "beverage",
+    "pakistan",
+    "sales",
+    "inventory"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "allowScripts": {
+    "@prisma/client@5.22.0": true,
+    "@prisma/engines@5.22.0": true,
+    "prisma@5.22.0": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.21.5": true,
+    "puppeteer@24.43.1": true
+  }
+}

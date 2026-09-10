@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en-PK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#dc2626">
+  <title>Offline - Beverage POS</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: linear-gradient(135deg, #fef2f2 0%, #ffffff 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    
+    .container {
+      max-width: 500px;
+      text-align: center;
+      background: white;
+      padding: 48px 32px;
+      border-radius: 16px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+    }
+    
+    .icon {
+      width: 80px;
+      height: 80px;
+      margin: 0 auto 24px;
+      background: #dc2626;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .icon svg {
+      width: 48px;
+      height: 48px;
+      fill: white;
+    }
+    
+    h1 {
+      color: #1f2937;
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+    
+    p {
+      color: #6b7280;
+      font-size: 16px;
+      line-height: 1.6;
+      margin-bottom: 32px;
+    }
+    
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 24px;
+      background: #fef2f2;
+      border: 2px solid #dc2626;
+      border-radius: 8px;
+      color: #dc2626;
+      font-weight: 600;
+      margin-bottom: 24px;
+    }
+    
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      background: #dc2626;
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    
+    .retry-button {
+      background: #dc2626;
+      color: white;
+      border: none;
+      padding: 14px 32px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-bottom: 16px;
+    }
+    
+    .retry-button:hover {
+      background: #b91c1c;
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);
+    }
+    
+    .retry-button:active {
+      transform: translateY(0);
+    }
+    
+    .help-text {
+      color: #9ca3af;
+      font-size: 14px;
+      margin-top: 24px;
+    }
+    
+    .features {
+      text-align: left;
+      margin-top: 32px;
+      padding-top: 32px;
+      border-top: 1px solid #e5e7eb;
+    }
+    
+    .features h2 {
+      color: #1f2937;
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    
+    .features ul {
+      list-style: none;
+      padding: 0;
+    }
+    
+    .features li {
+      color: #6b7280;
+      font-size: 14px;
+      padding: 8px 0;
+      padding-left: 24px;
+      position: relative;
+    }
+    
+    .features li::before {
+      content: '—';
+      position: absolute;
+      left: 0;
+      color: #10b981;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+      </svg>
+    </div>
+    
+    <h1>You're Offline</h1>
+    
+    <div class="status">
+      <span class="status-dot"></span>
+      <span>No Internet Connection</span>
+    </div>
+    
+    <p>
+      Don't worry! Your POS system is designed to work offline. 
+      You can continue processing sales and they will sync automatically when you're back online.
+    </p>
+    
+    <button class="retry-button" onclick="window.location.reload()">
+      Check Connection
+    </button>
+    
+    <p class="help-text">
+      The app will automatically reconnect when internet is available.
+    </p>
+    
+    <div class="features">
+      <h2>What You Can Do Offline:</h2>
+      <ul>
+        <li>Process sales and transactions</li>
+        <li>View cached product inventory</li>
+        <li>Access customer information</li>
+        <li>Generate receipts</li>
+        <li>Queue operations for sync</li>
+      </ul>
+    </div>
+  </div>
+  
+  <script>
+    // Check connection status periodically
+    function checkConnection() {
+      if (navigator.onLine) {
+        window.location.reload();
+      }
+    }
+    
+    // Check every 5 seconds
+    setInterval(checkConnection, 5000);
+    
+    // Also check on online event
+    window.addEventListener('online', () => {
+      window.location.reload();
+    });
+  </script>
+</body>
+</html>
