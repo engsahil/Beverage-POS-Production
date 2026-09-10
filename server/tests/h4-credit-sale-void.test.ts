@@ -120,7 +120,11 @@ function makeDb(options: ScenarioOptions) {
       ) ? { ...rows.inventory } : null,
       update: async ({ where, data }: any) => {
         if (where.id !== rows.inventory.id) throw new Error('Inventory not found');
-        Object.assign(rows.inventory, data);
+        if (data.currentQuantity?.increment !== undefined) {
+          rows.inventory.currentQuantity = rows.inventory.currentQuantity.plus(data.currentQuantity.increment);
+        } else {
+          Object.assign(rows.inventory, data);
+        }
         return { ...rows.inventory };
       },
     },

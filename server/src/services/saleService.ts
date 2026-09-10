@@ -61,6 +61,19 @@ async function generateSaleNumber(businessId: string, db: typeof prisma): Promis
   return `SALE-${String(next).padStart(6, '0')}`;
 }
 
+function isUniqueViolationFor(error: unknown, field: string): boolean {
+  if (!error || typeof error !== 'object') return false;
+
+  const candidate = error as { code?: string; message?: string; meta?: { target?: unknown } };
+  if (candidate.code !== 'P2002') return false;
+
+  const target = Array.isArray(candidate.meta?.target)
+    ? candidate.meta.target.join('_')
+    : String(candidate.meta?.target ?? '');
+  const message = candidate.message ?? '';
+  return target.includes(field) || message.toLowerCase().includes(field.toLowerCase());
+}
+
 /**
  * Create a completed sale
  *
@@ -183,11 +196,20 @@ export async function createSale(
     throw new Error('A customer account is required for partial payment or credit sales');
   }
 
-  // Generate sale number
-  const saleNumber = await generateSaleNumber(input.businessId, db);
+  // Allocate the number from the latest committed sale. The sale-number
+  // uniqueness constraint is the concurrency primitive: if another checkout
+  // wins the same number between this read and the insert, the transaction is
+  // retried with a fresh committed latest value. This does not hold a lock for
+  // the duration of every checkout.
+  let sale: any;
+  let numberRetries = 0;
 
-  // Create sale in a transaction
-  const sale = await db.$transaction(async (tx) => {
+  while (!sale) {
+    const saleNumber = await generateSaleNumber(input.businessId, db);
+
+    try {
+      // Create sale in a transaction
+      sale = await db.$transaction(async (tx) => {
     // Create sale
     const newSale = await tx.sale.create({
       data: {
@@ -259,21 +281,53 @@ export async function createSale(
         throw new Error(`Inventory not found for product ${item.productId}`);
       }
 
-      const currentQty = toDecimal(inventory.currentQuantity);
-      const newQty = currentQty.minus(toDecimal(item.quantity));
+      const requestedQty = toDecimal(item.quantity);
+      const observedQty = toDecimal(inventory.currentQuantity);
+      let previousQty = observedQty;
+      let newQty = observedQty.minus(requestedQty);
 
-      if (newQty.lessThan(0)) {
-        throw new Error(`Insufficient stock for product ${item.productId}`);
+      // The authoritative stock check and decrement must be one database
+      // operation. PostgreSQL re-evaluates the currentQuantity predicate after
+      // waiting for another inventory writer, so two checkouts cannot both
+      // spend the same units or overwrite a stock-in with a stale absolute
+      // value. The fallback keeps injected unit-test stores compatible; real
+      // Prisma clients always expose updateMany/findUnique.
+      if (typeof (tx.inventory as any).updateMany === 'function') {
+        const decrement = await (tx.inventory as any).updateMany({
+          where: {
+            id: inventory.id,
+            currentQuantity: { gte: requestedQty },
+          },
+          data: {
+            currentQuantity: { decrement: requestedQty },
+            lastMovementAt: new Date(),
+          },
+        });
+
+        if (decrement.count !== 1) {
+          throw new Error(`Insufficient stock for product ${item.productId}`);
+        }
+
+        const updatedInventory = typeof (tx.inventory as any).findUnique === 'function'
+          ? await (tx.inventory as any).findUnique({ where: { id: inventory.id } })
+          : null;
+        if (updatedInventory) {
+          newQty = toDecimal(updatedInventory.currentQuantity);
+          previousQty = newQty.plus(requestedQty);
+        }
+      } else {
+        if (newQty.lessThan(0)) {
+          throw new Error(`Insufficient stock for product ${item.productId}`);
+        }
+
+        await tx.inventory.update({
+          where: { id: inventory.id },
+          data: {
+            currentQuantity: newQty,
+            lastMovementAt: new Date(),
+          },
+        });
       }
-
-      // Update inventory
-      await tx.inventory.update({
-        where: { id: inventory.id },
-        data: {
-          currentQuantity: newQty,
-          lastMovementAt: new Date(),
-        },
-      });
 
       // Create stock movement
       await tx.stockMovement.create({
@@ -285,7 +339,7 @@ export async function createSale(
           variantId: item.variantId,
           movementType: 'SALE',
           quantity: -item.quantity, // Negative for sale
-          previousQuantity: currentQty,
+          previousQuantity: previousQty,
           resultingQuantity: newQty,
           referenceType: 'sale',
           referenceId: newSale.id,
@@ -299,6 +353,17 @@ export async function createSale(
     // credit portion of this sale; credit rules enforced here inside the
     // transaction so the balance can never be corrupted by a partial write)
     if (input.customerId && outstandingAmount.greaterThan(0)) {
+      // Credit validation and balance update must observe one serialized
+      // customer balance. The row lock is intentionally scoped to this
+      // customer, not to the whole business.
+      if (typeof (tx as any).$queryRaw === 'function') {
+        await (tx as any).$queryRaw`
+          SELECT id FROM customers
+          WHERE id = ${input.customerId} AND business_id = ${input.businessId}
+          FOR UPDATE
+        `;
+      }
+
       const customer = await tx.customer.findUnique({
         where: { id: input.customerId },
       });
@@ -337,7 +402,23 @@ export async function createSale(
     }
 
     return newSale;
-  });
+      });
+    } catch (error) {
+      if (input.idempotencyKey && isUniqueViolationFor(error, 'idempotency')) {
+        // Preserve the established direct-service behavior. Offline sync
+        // converts this durable unique-key result into an already-processed
+        // success and can reconcile the existing sale by key.
+        throw new Error('Duplicate sale submission detected');
+      }
+
+      if (isUniqueViolationFor(error, 'sale_number') && numberRetries < 32) {
+        numberRetries += 1;
+        continue;
+      }
+
+      throw error;
+    }
+  }
 
   // Audit log
   await audit({
@@ -526,6 +607,14 @@ export async function voidSale(
     // sale-refund entity or automatic refund workflow.
     const outstandingAmount = toDecimal(sale.outstandingAmount);
     if (sale.customerId && outstandingAmount.greaterThan(0)) {
+      if (typeof (tx as any).$queryRaw === 'function') {
+        await (tx as any).$queryRaw`
+          SELECT id FROM customers
+          WHERE id = ${sale.customerId} AND business_id = ${businessId}
+          FOR UPDATE
+        `;
+      }
+
       const customer = await tx.customer.findUnique({
         where: { id: sale.customerId },
       });
@@ -584,16 +673,28 @@ export async function voidSale(
       });
 
       if (inventory) {
-        const currentQty = toDecimal(inventory.currentQuantity);
-        const newQty = currentQty.plus(toDecimal(item.quantity));
+        const restoredQty = toDecimal(item.quantity);
+        const observedQty = toDecimal(inventory.currentQuantity);
 
-        await tx.inventory.update({
+        // Increment in the database rather than writing an absolute value
+        // derived from a stale read. This preserves concurrent stock-ins and
+        // checkout updates while the conditional sale claim above prevents a
+        // repeated void from restoring twice.
+        const updatedInventory = await tx.inventory.update({
           where: { id: inventory.id },
           data: {
-            currentQuantity: newQty,
+            currentQuantity: { increment: restoredQty },
             lastMovementAt: new Date(),
           },
         });
+
+        // Unit-test stores may not evaluate Prisma atomic operators; real
+        // Prisma returns the post-update Decimal value.
+        const atomicOperatorResult = updatedInventory?.currentQuantity as unknown;
+        const newQty = atomicOperatorResult && typeof atomicOperatorResult === 'object' && 'increment' in (atomicOperatorResult as object)
+          ? observedQty.plus(restoredQty)
+          : toDecimal((atomicOperatorResult as any) ?? observedQty.plus(restoredQty));
+        const currentQty = newQty.minus(restoredQty);
 
         // Create stock movement for void
         await tx.stockMovement.create({

@@ -178,11 +178,19 @@ export async function createPurchase(
     input.amountPaid
   );
 
-  // Generate purchase number
-  const purchaseNumber = await generatePurchaseNumber(input.businessId);
+  // Purchase numbers retain the PUR-XXXXXX format. A unique constraint
+  // collision means another creator committed the same latest number; retry
+  // the transaction with the next committed value without reserving a number
+  // on a failed transaction.
+  let purchase: any;
+  let numberRetries = 0;
 
-  // Create purchase with items in a transaction
-  const purchase = await prisma.$transaction(async (tx) => {
+  while (!purchase) {
+    const purchaseNumber = await generatePurchaseNumber(input.businessId);
+
+    try {
+      // Create purchase with items in a transaction
+      purchase = await prisma.$transaction(async (tx) => {
     const newPurchase = await tx.purchase.create({
       data: {
         businessId: input.businessId,
@@ -226,7 +234,23 @@ export async function createPurchase(
     });
 
     return newPurchase;
-  });
+      });
+    } catch (error) {
+      const candidate = error as { code?: string; message?: string; meta?: { target?: unknown } };
+      const target = Array.isArray(candidate.meta?.target)
+        ? candidate.meta.target.join('_')
+        : String(candidate.meta?.target ?? '');
+      const message = candidate.message ?? '';
+      const isNumberCollision = candidate.code === 'P2002' &&
+        (target.includes('purchase_number') || message.toLowerCase().includes('purchase_number'));
+
+      if (isNumberCollision && numberRetries < 32) {
+        numberRetries += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
 
   await createAuditLog({
     businessId: input.businessId,
@@ -533,14 +557,28 @@ export async function receivePurchase(
 
   // Update purchase and inventory in a single transaction
   const result = await prisma.$transaction(async (tx) => {
-    // Mark purchase as received
-    const updatedPurchase = await tx.purchase.update({
-      where: { id: purchaseId },
+    // Claim the draft atomically. Two concurrent receive requests may have
+    // read DRAFT before entering this transaction, but only one can perform
+    // the stock-in movements.
+    const claim = await tx.purchase.updateMany({
+      where: {
+        id: purchaseId,
+        businessId,
+        status: PURCHASE_STATUS.DRAFT,
+      },
       data: {
         status: PURCHASE_STATUS.RECEIVED,
         receivedAt: new Date(),
         receivedBy: userId,
       },
+    });
+
+    if (claim.count !== 1) {
+      throw new Error('Only draft purchases can be received');
+    }
+
+    const updatedPurchase = await tx.purchase.findFirst({
+      where: { id: purchaseId, businessId },
       include: {
         vendor: { select: { id: true, name: true } },
         branch: { select: { id: true, name: true } },
@@ -552,6 +590,10 @@ export async function receivePurchase(
         },
       },
     });
+
+    if (!updatedPurchase) {
+      throw new Error('Purchase not found');
+    }
 
     // Create stock movements for each item
     for (const item of purchase.items) {
@@ -566,7 +608,7 @@ export async function receivePurchase(
         referenceType: 'purchase',
         referenceId: purchase.id,
         performedBy: userId,
-      });
+      }, { db: tx });
     }
 
     return updatedPurchase;

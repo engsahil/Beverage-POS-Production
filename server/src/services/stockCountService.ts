@@ -174,15 +174,32 @@ export async function confirmStockCount(
 
   // Confirm in a transaction
   const result = await prisma.$transaction(async (tx) => {
-    // Update stock count status
-    const updatedCount = await tx.stockCount.update({
-      where: { id: input.stockCountId },
+    // Claim the draft atomically so concurrent confirmations cannot apply the
+    // same adjustment movements twice.
+    const claim = await tx.stockCount.updateMany({
+      where: {
+        id: input.stockCountId,
+        businessId: input.businessId,
+        status: 'DRAFT',
+      },
       data: {
         status: 'CONFIRMED',
         confirmedBy: userId,
         confirmedAt: new Date(),
       },
     });
+
+    if (claim.count !== 1) {
+      throw new Error('Only draft stock counts can be confirmed');
+    }
+
+    const updatedCount = await tx.stockCount.findUnique({
+      where: { id: input.stockCountId },
+    });
+
+    if (!updatedCount) {
+      throw new Error('Stock count not found');
+    }
 
     // Create adjustments for items with differences
     for (const item of stockCount.items) {
@@ -202,7 +219,7 @@ export async function confirmStockCount(
           referenceType: 'stock_count',
           referenceId: stockCount.id,
           performedBy: userId,
-        });
+        }, { db: tx });
       }
     }
 

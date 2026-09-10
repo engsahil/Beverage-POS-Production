@@ -17,6 +17,8 @@
 import prisma from '../lib/prisma.js';
 import * as checkoutService from './checkoutService.js';
 import * as saleService from './saleService.js';
+import * as customerPaymentService from './customerPaymentService.js';
+import { createStockMovement } from './inventoryService.js';
 
 // ==========================================
 // Types
@@ -260,11 +262,28 @@ async function processSaleCreate(
       };
     }
 
-    // Check if it's a duplicate submission
+    // Check if it's a duplicate submission. The sale's durable unique
+    // idempotency key is the source of truth even when the sync-record write
+    // raced or the process crashed after committing the sale.
     if (errorMessage.includes('Duplicate sale submission')) {
+      const existingSale = await prisma.sale.findUnique({
+        where: { idempotencyKey: operation.idempotencyKey },
+        select: { id: true, businessId: true, saleNumber: true },
+      });
+
+      if (existingSale?.businessId === businessId) {
+        return {
+          operationId: operation.operationId,
+          success: true,
+          serverEntityId: existingSale.id,
+          serverEntityNumber: existingSale.saleNumber,
+          retryable: false,
+        };
+      }
+
       return {
         operationId: operation.operationId,
-        success: true, // Already processed
+        success: true, // Already processed, but do not expose another tenant's row
         retryable: false,
       };
     }
@@ -350,47 +369,19 @@ async function processCustomerPayment(
       };
     }
 
-    // Create the payment using existing service
-    const previousBalance = customer.currentBalance;
-    const newBalance = previousBalance.minus(Number(payload.amount));
-
-    const payment = await prisma.customerPayment.create({
-      data: {
-        businessId,
-        customerId: payload.customerId,
-        paymentDate: new Date(payload.paymentDate || operation.createdAt),
-        paymentMethod: payload.paymentMethod || 'CASH',
-        amount: Number(payload.amount),
-        referenceNumber: payload.referenceNumber,
-        previousBalance,
-        newBalance,
-        notes: payload.notes,
-        idempotencyKey: operation.idempotencyKey,
-        userId,
-      },
-    });
-
-    // Update customer balance
-    await prisma.customer.update({
-      where: { id: payload.customerId },
-      data: { currentBalance: newBalance },
-    });
-
-    // Create ledger entry
-    await prisma.customerLedger.create({
-      data: {
-        businessId,
-        customerId: payload.customerId,
-        ledgerDate: new Date(payload.paymentDate || operation.createdAt),
-        referenceType: 'PAYMENT',
-        referenceId: payment.id,
-        description: `Customer payment received`,
-        debit: 0,
-        credit: Number(payload.amount),
-        balance: newBalance,
-        userId,
-        notes: payload.notes,
-      },
+    // The service owns the transaction that contains payment, locked
+    // customer balance, and ledger entry. Keeping this path on that service
+    // also prevents offline sync from reintroducing a stale-balance write.
+    const payment = await customerPaymentService.createCustomerPayment({
+      businessId,
+      customerId: payload.customerId,
+      paymentDate: new Date(payload.paymentDate || operation.createdAt),
+      paymentMethod: payload.paymentMethod || 'CASH',
+      amount: Number(payload.amount),
+      referenceNumber: payload.referenceNumber,
+      notes: payload.notes,
+      idempotencyKey: operation.idempotencyKey,
+      userId,
     });
 
     return {
@@ -402,12 +393,21 @@ async function processCustomerPayment(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Payment creation failed';
     
-    if (errorMessage.includes('Unique constraint') && errorMessage.includes('idempotencyKey')) {
-      return {
-        operationId: operation.operationId,
-        success: true,
-        retryable: false,
-      };
+    if (errorMessage.includes('Duplicate payment submission') ||
+        (errorMessage.includes('Unique constraint') && errorMessage.includes('idempotencyKey'))) {
+      const existingPayment = await prisma.customerPayment.findUnique({
+        where: { idempotencyKey: operation.idempotencyKey },
+        select: { id: true, businessId: true },
+      });
+
+      if (existingPayment?.businessId === businessId) {
+        return {
+          operationId: operation.operationId,
+          success: true,
+          serverEntityId: existingPayment.id,
+          retryable: false,
+        };
+      }
     }
 
     return {
@@ -783,7 +783,10 @@ async function processStockAdjustment(
       };
     }
 
-    // Find inventory record
+    // Preserve the existing not-found response, but do not use this read as
+    // the stock calculation. The authoritative movement below locks the
+    // inventory entity and computes previous/resulting quantities while
+    // holding the outer sync transaction.
     const inventory = await prisma.inventory.findFirst({
       where: {
         businessId,
@@ -791,6 +794,7 @@ async function processStockAdjustment(
         productId: payload.productId,
         variantId: payload.variantId || null,
       },
+      select: { id: true },
     });
 
     if (!inventory) {
@@ -803,43 +807,31 @@ async function processStockAdjustment(
       };
     }
 
-    const previousStock = Number(inventory.currentQuantity);
     const adjustmentQty = Number(payload.quantity);
-    const newStock = payload.adjustmentType === 'INCREASE'
-      ? previousStock + adjustmentQty
-      : previousStock - adjustmentQty;
+    const movementQty = payload.adjustmentType === 'INCREASE' ? adjustmentQty : -adjustmentQty;
 
-    // Create adjustment and movement in transaction
+    // Create adjustment and movement in one transaction. This replaces the
+    // old stale-read/absolute-write path, which could overwrite a concurrent
+    // checkout or stock-in.
     const result = await prisma.$transaction(async (tx) => {
-      // Update inventory
-      await tx.inventory.update({
-        where: { id: inventory.id },
-        data: {
-          currentQuantity: newStock,
-          lastMovementAt: new Date(),
-        },
-      });
+      const movementResult = await createStockMovement({
+        businessId,
+        branchId: effectiveBranchId,
+        productId: payload.productId,
+        variantId: payload.variantId,
+        movementType: 'ADJUSTMENT',
+        quantity: movementQty,
+        reason: payload.reason,
+        notes: payload.notes,
+        referenceType: 'offline_sync',
+        referenceId: operation.operationId,
+        performedBy: userId,
+      }, { db: tx });
 
-      // Create stock movement
-      const movement = await tx.stockMovement.create({
-        data: {
-          businessId,
-          branchId: effectiveBranchId,
-          inventoryId: inventory.id,
-          productId: payload.productId,
-          variantId: payload.variantId,
-          movementType: 'ADJUSTMENT',
-          quantity: payload.adjustmentType === 'INCREASE' ? adjustmentQty : -adjustmentQty,
-          previousQuantity: previousStock,
-          resultingQuantity: newStock,
-          reason: payload.reason,
-          notes: payload.notes,
-          performedBy: userId,
-        },
-      });
+      const previousStock = Number(movementResult.movement.previousQuantity);
+      const newStock = Number(movementResult.movement.resultingQuantity);
 
-      // Create adjustment record
-      const adjustment = await tx.stockAdjustment.create({
+      return tx.stockAdjustment.create({
         data: {
           businessId,
           branchId: effectiveBranchId,
@@ -851,12 +843,10 @@ async function processStockAdjustment(
           notes: payload.notes,
           previousStock,
           newStock,
-          movementId: movement.id,
+          movementId: movementResult.movement.id,
           performedBy: userId,
         },
       });
-
-      return adjustment;
     });
 
     return {
@@ -907,8 +897,13 @@ async function recordIdempotency(
   deviceId: string | undefined,
   responseBody?: Record<string, unknown>
 ) {
-  await prisma.idempotencyRecord.create({
-    data: {
+  // The initial check and the sale transaction are intentionally separate.
+  // Upsert makes the durable sync record safe when two retries finish the
+  // same operation concurrently; the sale's unique idempotency key remains
+  // the authoritative operation claim.
+  await prisma.idempotencyRecord.upsert({
+    where: { idempotencyKey },
+    create: {
       idempotencyKey,
       operationType,
       entityType,
@@ -921,6 +916,7 @@ async function recordIdempotency(
       responseBody: responseBody ? responseBody as any : undefined,
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
     },
+    update: {},
   });
 }
 

@@ -784,7 +784,7 @@ model Sale {
   id                String    @id @default(uuid())
   businessId        String    @map("business_id")
   branchId          String    @map("branch_id")
-  saleNumber        String    @unique @map("sale_number")
+  saleNumber        String    @map("sale_number")
   saleDate          DateTime  @map("sale_date")
   status            String    @default("COMPLETED") // COMPLETED, VOIDED, REFUNDED
   subtotal          Decimal   @db.Decimal(10, 2)
@@ -814,6 +814,7 @@ model Sale {
   items    SaleItem[]
   payments Payment[]
 
+  @@unique([businessId, saleNumber])
   @@index([businessId])
   @@index([branchId])
   @@index([saleNumber])
