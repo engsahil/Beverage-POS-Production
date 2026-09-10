@@ -87,8 +87,10 @@ export function calculateStockStatus(
 /**
  * Get negative stock configuration for a business
  */
-async function getNegativeStockConfig(businessId: string): Promise<boolean> {
-  const setting = await prisma.setting.findFirst({
+type InventoryDb = typeof prisma | Prisma.TransactionClient;
+
+async function getNegativeStockConfig(businessId: string, db: InventoryDb = prisma): Promise<boolean> {
+  const setting = await db.setting.findFirst({
     where: {
       businessId,
       key: 'allow_negative_stock',
@@ -103,8 +105,13 @@ async function getNegativeStockConfig(businessId: string): Promise<boolean> {
 // ==========================================
 // Stock Status Calculation
 // ==========================================
+export interface StockMovementOptions {
+  db?: Prisma.TransactionClient;
+}
+
 export async function createStockMovement(
-  input: StockMovementInput
+  input: StockMovementInput,
+  options: StockMovementOptions = {}
 ): Promise<{
   inventory: {
     id: string;
@@ -133,8 +140,12 @@ export async function createStockMovement(
     performedBy,
   } = input;
 
-  // Validate product belongs to business
-  const product = await prisma.product.findFirst({
+  const db = options.db ?? prisma;
+
+  // Validate the references through the same client that will perform the
+  // movement. Callers that pass an outer transaction therefore cannot commit a
+  // status transition while an inventory movement is rolled back separately.
+  const product = await db.product.findFirst({
     where: { id: productId, businessId },
     include: { variants: true },
   });
@@ -143,7 +154,6 @@ export async function createStockMovement(
     throw new Error('Product not found or does not belong to this business');
   }
 
-  // Validate variant if provided
   if (variantId) {
     const variant = product.variants.find(v => v.id === variantId);
     if (!variant) {
@@ -151,8 +161,7 @@ export async function createStockMovement(
     }
   }
 
-  // Validate branch belongs to business
-  const branch = await prisma.branch.findFirst({
+  const branch = await db.branch.findFirst({
     where: { id: branchId, businessId },
   });
 
@@ -160,8 +169,7 @@ export async function createStockMovement(
     throw new Error('Branch not found or does not belong to this business');
   }
 
-  // Validate user belongs to business
-  const user = await prisma.user.findFirst({
+  const user = await db.user.findFirst({
     where: { id: performedBy, businessId },
   });
 
@@ -169,9 +177,16 @@ export async function createStockMovement(
     throw new Error('User not found or does not belong to this business');
   }
 
-  // Use a serializable transaction with row-level locking for concurrency safety
-  const result = await prisma.$transaction(async (tx) => {
-    // Try to lock existing inventory row using SELECT FOR UPDATE
+  const runMovement = async (tx: Prisma.TransactionClient) => {
+    // SELECT FOR UPDATE protects existing rows. The advisory lock also covers
+    // the missing-row case (and PostgreSQL NULL uniqueness semantics for a
+    // base-product inventory row), without serializing unrelated products or
+    // branches.
+    const inventoryLockKey = `inventory:${businessId}:${branchId}:${productId}:${variantId ?? ''}`;
+    await tx.$queryRaw`
+      SELECT pg_advisory_xact_lock(hashtextextended(${inventoryLockKey}, 0))
+    `;
+
     const lockedRows = await tx.$queryRawUnsafe(
       `SELECT * FROM inventories WHERE business_id = $1 AND branch_id = $2 AND product_id = $3 AND (variant_id = $4 OR (variant_id IS NULL AND $4 IS NULL)) FOR UPDATE`,
       businessId, branchId, productId, variantId || null
@@ -184,7 +199,6 @@ export async function createStockMovement(
       inventoryId = lockedRows[0].id;
       previousQuantity = Number(lockedRows[0].current_quantity);
     } else {
-      // Create new inventory record
       const newInventory = await tx.inventory.create({
         data: {
           businessId,
@@ -201,9 +215,8 @@ export async function createStockMovement(
 
     const newQuantity = previousQuantity + quantity;
 
-    // Check negative stock configuration
     if (quantity < 0 && newQuantity < 0) {
-      const allowNegative = await getNegativeStockConfig(businessId);
+      const allowNegative = await getNegativeStockConfig(businessId, tx);
       if (!allowNegative) {
         throw new Error(
           `Insufficient stock. Available: ${previousQuantity}, Requested deduction: ${Math.abs(quantity)}`
@@ -211,7 +224,6 @@ export async function createStockMovement(
       }
     }
 
-    // Update inventory balance
     const updatedInventory = await tx.inventory.update({
       where: { id: inventoryId },
       data: {
@@ -220,7 +232,6 @@ export async function createStockMovement(
       },
     });
 
-    // Create stock movement ledger entry
     const movement = await tx.stockMovement.create({
       data: {
         businessId,
@@ -254,11 +265,15 @@ export async function createStockMovement(
         resultingQuantity: movement.resultingQuantity,
       },
     };
-  }, {
-    isolationLevel: 'ReadCommitted',
-    maxWait: 5000,
-    timeout: 10000,
-  });
+  };
+
+  const result = options.db
+    ? await runMovement(options.db)
+    : await prisma.$transaction(runMovement, {
+      isolationLevel: 'ReadCommitted',
+      maxWait: 5000,
+      timeout: 10000,
+    });
 
   // Emit realtime events AFTER successful commit
   const event = eventEmitter.createBaseEvent(

@@ -52,10 +52,34 @@ export async function createCustomerPayment(
     throw new Error(`Invalid payment method: ${input.paymentMethod}`);
   }
 
-  const previousBalance = toDecimal(customer.currentBalance);
-  const newBalance = previousBalance.minus(toDecimal(input.amount));
+  // These values are assigned after the customer row is locked inside the
+  // transaction. The preflight customer read above is only validation/UI
+  // context and must not be used for the authoritative balance calculation.
+  let previousBalance = toDecimal(customer.currentBalance);
+  let newBalance = previousBalance;
 
   const payment = await prisma.$transaction(async (tx) => {
+    await (tx as any).$queryRaw`
+      SELECT id FROM customers
+      WHERE id = ${input.customerId} AND business_id = ${input.businessId}
+      FOR UPDATE
+    `;
+
+    const lockedCustomer = await tx.customer.findUnique({
+      where: { id: input.customerId },
+    });
+
+    if (!lockedCustomer || lockedCustomer.businessId !== input.businessId) {
+      throw new Error('Customer not found');
+    }
+
+    if (lockedCustomer.status !== 'ACTIVE') {
+      throw new Error('Cannot record payment for inactive customer');
+    }
+
+    previousBalance = toDecimal(lockedCustomer.currentBalance);
+    newBalance = previousBalance.minus(toDecimal(input.amount));
+
     const newPayment = await tx.customerPayment.create({
       data: {
         businessId: input.businessId,

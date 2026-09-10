@@ -184,11 +184,27 @@ export async function approveTransfer(
 
   // Approve in a transaction - deduct from source branch
   const result = await prisma.$transaction(async (tx) => {
-    // Update transfer status
-    const updatedTransfer = await tx.transfer.update({
-      where: { id: transferId },
+    // Claim the draft atomically before deducting source inventory.
+    const claim = await tx.transfer.updateMany({
+      where: {
+        id: transferId,
+        businessId,
+        status: 'DRAFT',
+      },
       data: { status: 'IN_TRANSIT' },
     });
+
+    if (claim.count !== 1) {
+      throw new Error('Only draft transfers can be approved');
+    }
+
+    const updatedTransfer = await tx.transfer.findUnique({
+      where: { id: transferId },
+    });
+
+    if (!updatedTransfer) {
+      throw new Error('Transfer not found');
+    }
 
     // Create TRANSFER_OUT movements for source branch
     for (const item of transfer.items) {
@@ -203,7 +219,7 @@ export async function approveTransfer(
         referenceType: 'transfer',
         referenceId: transfer.id,
         performedBy: userId,
-      });
+      }, { db: tx });
 
       // Update transfer item with out movement ID
       await tx.transferItem.update({
@@ -271,15 +287,33 @@ export async function receiveTransfer(
 
   // Receive in a transaction - add to destination branch
   const result = await prisma.$transaction(async (tx) => {
-    // Update transfer status
-    const updatedTransfer = await tx.transfer.update({
-      where: { id: input.transferId },
+    // Claim the in-transit transfer atomically before adding destination
+    // inventory. This prevents duplicate receives under concurrent retries.
+    const claim = await tx.transfer.updateMany({
+      where: {
+        id: input.transferId,
+        businessId: input.businessId,
+        status: 'IN_TRANSIT',
+        receivedBy: null,
+      },
       data: {
         status: 'RECEIVED',
         receivedBy: userId,
         receivedAt: new Date(),
       },
     });
+
+    if (claim.count !== 1) {
+      throw new Error('Only in-transit transfers can be received');
+    }
+
+    const updatedTransfer = await tx.transfer.findUnique({
+      where: { id: input.transferId },
+    });
+
+    if (!updatedTransfer) {
+      throw new Error('Transfer not found');
+    }
 
     // Create TRANSFER_IN movements for destination branch
     for (const item of transfer.items) {
@@ -294,7 +328,7 @@ export async function receiveTransfer(
         referenceType: 'transfer',
         referenceId: transfer.id,
         performedBy: userId,
-      });
+      }, { db: tx });
 
       // Update transfer item with in movement ID
       await tx.transferItem.update({
@@ -360,6 +394,21 @@ export async function cancelTransfer(
   // If transfer is IN_TRANSIT, we need to reverse the stock movements
   if (transfer.status === 'IN_TRANSIT') {
     await prisma.$transaction(async (tx) => {
+      // Claim the in-transit transfer before reversing stock. A second
+      // cancellation therefore cannot create a second reversal movement.
+      const claim = await tx.transfer.updateMany({
+        where: {
+          id: transferId,
+          businessId,
+          status: 'IN_TRANSIT',
+        },
+        data: { status: 'CANCELLED' },
+      });
+
+      if (claim.count !== 1) {
+        throw new Error('Transfer is already cancelled or has changed status');
+      }
+
       // Reverse the TRANSFER_OUT movements
       for (const item of transfer.items) {
         await createStockMovement({
@@ -373,21 +422,24 @@ export async function cancelTransfer(
           referenceType: 'transfer',
           referenceId: transfer.id,
           performedBy: userId,
-        });
+        }, { db: tx });
       }
 
-      // Update transfer status
-      await tx.transfer.update({
-        where: { id: transferId },
-        data: { status: 'CANCELLED' },
-      });
     });
   } else {
-    // DRAFT status - just update status
-    await prisma.transfer.update({
-      where: { id: transferId },
+    // DRAFT status - claim it atomically.
+    const claim = await prisma.transfer.updateMany({
+      where: {
+        id: transferId,
+        businessId,
+        status: 'DRAFT',
+      },
       data: { status: 'CANCELLED' },
     });
+
+    if (claim.count !== 1) {
+      throw new Error('Transfer is already cancelled or has changed status');
+    }
   }
 
   await createAuditLog({

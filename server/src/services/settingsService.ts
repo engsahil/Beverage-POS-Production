@@ -1122,27 +1122,81 @@ function validateLogoFile(buffer: Buffer, fileName: string, mimeType: string): v
 // INVOICE NUMBER GENERATION
 // ==========================================
 
-export async function generateInvoiceNumber(businessId: string): Promise<string> {
-  const settings = await getInvoiceSettings(businessId);
-  
-  // Check if annual reset is needed
-  if (settings.resetAnnually && settings.lastResetDate) {
-    const lastReset = new Date(settings.lastResetDate);
-    const now = new Date();
-    if (now.getFullYear() > lastReset.getFullYear()) {
-      settings.nextNumber = 1;
-      settings.lastResetDate = now.toISOString();
-      await updateSettings(businessId, 'system', SETTINGS_KEYS.INVOICE, settings);
-    }
+export async function generateInvoiceNumber(
+  businessId: string,
+  deps?: {
+    prisma?: typeof prisma;
+    audit?: typeof createAuditLog;
   }
+): Promise<string> {
+  const db = deps?.prisma ?? prisma;
+  const audit = deps?.audit ?? createAuditLog;
+  const allocation = await db.$transaction(async (tx) => {
+    // Lock only this business's invoice counter boundary. Unlike a process
+    // mutex, this works across workers and releases as soon as the small
+    // settings transaction commits.
+    await (tx as any).$queryRaw`
+      SELECT id FROM businesses WHERE id = ${businessId} FOR UPDATE
+    `;
 
-  // Generate number
-  const number = String(settings.nextNumber).padStart(settings.padLength, '0');
-  const invoiceNumber = `${settings.prefix}${number}`;
+    const existing = await tx.setting.findUnique({
+      where: {
+        businessId_key: { businessId, key: SETTINGS_KEYS.INVOICE },
+      },
+    });
 
-  // Increment for next use
-  settings.nextNumber++;
-  await updateSettings(businessId, 'system', SETTINGS_KEYS.INVOICE, settings);
+    const previousSettings: InvoiceSettings = {
+      ...DEFAULT_INVOICE_SETTINGS,
+      ...((existing?.value as Partial<InvoiceSettings> | null) ?? {}),
+    };
+    const settings: InvoiceSettings = { ...previousSettings };
+    const now = new Date();
 
-  return invoiceNumber;
+    // Check if annual reset is needed while holding the same database lock as
+    // the increment, so the reset cannot race with an allocation.
+    if (settings.resetAnnually && settings.lastResetDate) {
+      const lastReset = new Date(settings.lastResetDate);
+      if (now.getFullYear() > lastReset.getFullYear()) {
+        settings.nextNumber = 1;
+        settings.lastResetDate = now.toISOString();
+      }
+    }
+
+    const number = String(settings.nextNumber).padStart(settings.padLength, '0');
+    const invoiceNumber = `${settings.prefix}${number}`;
+    settings.nextNumber += 1;
+
+    await tx.setting.upsert({
+      where: {
+        businessId_key: { businessId, key: SETTINGS_KEYS.INVOICE },
+      },
+      update: { value: settings as any },
+      create: {
+        businessId,
+        key: SETTINGS_KEYS.INVOICE,
+        value: settings as any,
+      },
+    });
+
+    return { invoiceNumber, previousSettings, settings };
+  });
+
+  // Keep the existing system audit trail. The number allocation itself has
+  // already committed atomically before this non-financial audit write.
+  await audit({
+    businessId,
+    userId: 'system',
+    action: 'SETTING_UPDATED',
+    entityType: 'Setting',
+    entityId: SETTINGS_KEYS.INVOICE,
+    oldValues: { value: allocation.previousSettings },
+    newValues: { value: allocation.settings },
+  });
+
+  logger.info('Invoice number generated', {
+    businessId,
+    invoiceNumber: allocation.invoiceNumber,
+  });
+
+  return allocation.invoiceNumber;
 }

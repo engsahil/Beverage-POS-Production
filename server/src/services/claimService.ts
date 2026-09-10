@@ -563,6 +563,26 @@ export async function resolveClaim(
   validateStatusTransition(claim.status, 'RESOLVED');
 
   await prisma.$transaction(async (tx) => {
+    // Claim the current state atomically before applying inventory. A retry
+    // cannot resolve the same claim or repeat its stock-out movements.
+    const stateClaim = await tx.claim.updateMany({
+      where: {
+        id: claimId,
+        businessId,
+        status: claim.status,
+      },
+      data: {
+        status: 'RESOLVED',
+        resolvedBy: userId,
+        resolvedAt: new Date(),
+        resolutionNotes,
+      },
+    });
+
+    if (stateClaim.count !== 1) {
+      throw new Error('Claim status changed before resolution');
+    }
+
     // Apply inventory action if requested
     if (applyInventoryAction) {
       for (const item of claim.items) {
@@ -586,7 +606,7 @@ export async function resolveClaim(
           referenceType: 'CLAIM',
           referenceId: claim.id,
           performedBy: userId,
-        });
+        }, { db: tx });
 
         // Link movement to claim item
         await tx.claimItem.update({
@@ -596,16 +616,6 @@ export async function resolveClaim(
       }
     }
 
-    // Update claim status
-    await tx.claim.update({
-      where: { id: claimId },
-      data: {
-        status: 'RESOLVED',
-        resolvedBy: userId,
-        resolvedAt: new Date(),
-        resolutionNotes,
-      },
-    });
   });
 
   await createAuditLog({
