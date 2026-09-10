@@ -4,6 +4,8 @@ import {
   calculateCartTotals,
   calculateCashChange,
   validatePayment,
+  validateSalePayments,
+  validateCustomerCredit,
   isDiscountAllowed,
   toDecimal,
   roundCurrency,
@@ -162,6 +164,25 @@ export async function validateCheckout(
 }
 
 /**
+ * H1: Compute per-tender cash change for the checkout payment lines.
+ *
+ * Change is a per tender line concept: cash given minus the amount tendered
+ * on THAT line. (It was previously computed against the whole sale total,
+ * which wrongly rejected partial cash payments on credit/partial sales.)
+ * Pure function — no database access.
+ */
+export function applyCashChanges(payments: CheckoutCartInput['payments']) {
+  return payments.map(payment => {
+    if (payment.paymentMethod === 'CASH' && payment.cashReceived) {
+      const { change, isValid } = calculateCashChange(payment.amount, payment.cashReceived);
+      if (!isValid) throw new Error('Insufficient cash received');
+      return { ...payment, cashChange: Number(roundCurrency(change)) };
+    }
+    return payment;
+  });
+}
+
+/**
  * Process checkout
  */
 export async function processCheckout(
@@ -269,57 +290,52 @@ export async function processCheckout(
   const taxAmount = roundCurrency(calculation.taxAmount);
   const total = roundCurrency(finalTotal);
 
-  const paymentsWithChange = input.payments.map(payment => {
-    if (payment.paymentMethod === 'CASH' && payment.cashReceived) {
-      const { change, isValid } = calculateCashChange(total, payment.cashReceived);
-      if (!isValid) throw new Error('Insufficient cash received');
-      return { ...payment, cashChange: Number(roundCurrency(change)) };
-    }
-    return payment;
-  });
+  const paymentsWithChange = applyCashChanges(input.payments);
 
   const paymentValidation = validatePayment(total, paymentsWithChange);
-  
+
+  // H1: recorded payments must never exceed the sale total — handing the
+  // cashier more money than owed is only supported as CASH change
+  // (cashReceived > tendered amount), never as an overpaid payment record.
+  if (paymentValidation.paidAmount.greaterThan(total)) {
+    throw new Error(
+      'Payment exceeds the sale total. Collect any extra amount as cash change (cash received) instead of overpaying the recorded payment.'
+    );
+  }
+
   // Handle credit sales (when payment is less than total and customer is provided)
   let outstandingAmount = new Decimal(0);
   let amountPaid = total;
-  
+
   if (input.customerId && paymentValidation.remaining.greaterThan(0)) {
     // This is a credit sale
     outstandingAmount = paymentValidation.remaining;
     amountPaid = paymentValidation.paidAmount;
-    
-    // Validate customer credit limit
+
+    // Validate customer credit eligibility (shared rules, also re-checked
+    // inside the sale transaction)
     const customer = await prisma.customer.findFirst({
       where: { id: input.customerId, businessId: input.businessId },
     });
-    
+
     if (!customer) {
       throw new Error('Customer not found');
     }
-    
-    if (customer.status !== 'ACTIVE') {
-      throw new Error('Cannot create credit sale for inactive customer');
-    }
-    
-    const creditLimit = toDecimal(customer.creditLimit);
-    const currentBalance = toDecimal(customer.currentBalance);
-    const newBalance = currentBalance.plus(outstandingAmount);
-    
-    if (creditLimit.equals(0)) {
-      throw new Error('Customer has no credit limit configured');
-    }
-    
-    if (newBalance.greaterThan(creditLimit)) {
-      throw new Error(
-        `Credit limit exceeded. Current balance: Rs. ${currentBalance.toFixed(2)}, ` +
-        `Credit limit: Rs. ${creditLimit.toFixed(2)}, ` +
-        `Requested credit: Rs. ${outstandingAmount.toFixed(2)}`
-      );
+
+    const creditCheck = validateCustomerCredit(customer, outstandingAmount);
+    if (!creditCheck.ok) {
+      throw new Error(creditCheck.error);
     }
   } else if (!paymentValidation.isValid) {
     // No customer provided and payment is insufficient - reject
     throw new Error(`Payment shortfall: ${paymentValidation.remaining.toFixed(2)}`);
+  }
+
+  // H1: final reconciliation guard before any financial mutation — the
+  // tendered payments plus the outstanding credit must equal the sale total.
+  const reconciliation = validateSalePayments(total, paymentsWithChange);
+  if (reconciliation.error) {
+    throw new Error(reconciliation.error);
   }
 
   const sale = await createSale({

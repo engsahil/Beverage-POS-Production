@@ -318,15 +318,28 @@ export default function POS() {
     setError('');
 
     const totalPaid = payments.reduce((sum, p) => sum + p.amount, 0);
-    if (totalPaid < total) {
+    if (totalPaid > total) {
       setError(
-        `Payment balance (Rs. ${totalPaid.toFixed(2)}) is less than grand total (Rs. ${total.toFixed(2)})`
+        `Tendered amount (Rs. ${totalPaid.toFixed(2)}) exceeds the grand total (Rs. ${total.toFixed(2)}). Use "Cash Given" to return change.`
       );
       setLoading(false);
       return;
     }
+    const creditPortion = Math.round((total - totalPaid) * 100) / 100;
+    if (creditPortion > 0 && !selectedCustomer) {
+      setError(
+        `Payment balance (Rs. ${totalPaid.toFixed(2)}) is less than grand total (Rs. ${total.toFixed(2)}). Select a customer to place the remaining Rs. ${creditPortion.toFixed(2)} on their account.`
+      );
+      setLoading(false);
+      return;
+    }
+    if (creditPortion > 0 && selectedCustomer && !confirm(`CREDIT SALE: Rs. ${creditPortion.toFixed(2)} will be added to ${selectedCustomer.name}'s account as outstanding balance. Continue?`)) {
+      setLoading(false);
+      return;
+    }
 
-    const paymentData = payments.map((p) => ({
+    // Zero-amount lines are not real tenders (full credit sends no payments)
+    const paymentData = payments.filter((p) => p.amount > 0).map((p) => ({
       paymentMethod: p.method,
       amount: p.amount,
       referenceNumber: p.referenceNumber || null,
@@ -1262,6 +1275,12 @@ export default function POS() {
                       <span className="mono">Rs. {Math.max(0, change).toFixed(2)}</span>
                     </div>
                   )}
+                  {totalPaid < total && selectedCustomer && (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, fontWeight: 600, color: '#b45309' }}>
+                      <span>Credit to {selectedCustomer.name}'s account:</span>
+                      <span className="mono">Rs. {(total - totalPaid).toFixed(2)}</span>
+                    </div>
+                  )}
                 </div>
               );
             })()}
@@ -1285,16 +1304,16 @@ export default function POS() {
               </button>
               <button
                 onClick={handleCheckout}
-                disabled={loading || payments.reduce((s, p) => s + p.amount, 0) < total}
+                disabled={loading || (payments.reduce((s, p) => s + p.amount, 0) < total && !selectedCustomer)}
                 style={{
                   flex: 2,
                   padding: '10px 20px',
-                  background: loading || payments.reduce((s, p) => s + p.amount, 0) < total ? '#cbd5e1' : 'var(--primary)',
+                  background: loading || (payments.reduce((s, p) => s + p.amount, 0) < total && !selectedCustomer) ? '#cbd5e1' : 'var(--primary)',
                   color: '#ffffff',
                   borderRadius: 'var(--radius-sm)',
                   fontSize: 14,
                   fontWeight: 700,
-                  cursor: loading || payments.reduce((s, p) => s + p.amount, 0) < total ? 'not-allowed' : 'pointer',
+                  cursor: loading || (payments.reduce((s, p) => s + p.amount, 0) < total && !selectedCustomer) ? 'not-allowed' : 'pointer',
                 }}
               >
                 {loading ? 'Completing Transaction...' : 'Complete & Print Receipt'}

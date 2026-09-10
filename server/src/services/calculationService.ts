@@ -202,6 +202,105 @@ export function validatePayment(
 }
 
 /**
+ * H1: Authoritative payment breakdown for a sale.
+ *
+ * Sums the tendered payment lines with Decimal arithmetic and derives the
+ * outstanding (credit) amount so the financial invariant always holds:
+ *
+ *   sale total = paid amount + outstanding credit
+ *
+ * Overpayment is not accepted here — the only supported way to hand the
+ * cashier more money than the total is CASH change (cashReceived greater
+ * than the tendered payment amount), which never makes the recorded
+ * payment exceed the total. Returns a validation error instead of
+ * silently inventing financial state.
+ */
+export function validateSalePayments(
+  total: number | Decimal,
+  payments: Array<{ amount: number | Decimal }>
+): { paidAmount: Decimal; outstandingAmount: Decimal; error: string | null } {
+  const totalDecimal = roundCurrency(toDecimal(total));
+  const paidAmount = payments.reduce(
+    (sum, payment) => sum.plus(toDecimal(payment.amount)),
+    new Decimal(0)
+  );
+
+  if (paidAmount.isNegative()) {
+    return {
+      paidAmount: roundCurrency(paidAmount),
+      outstandingAmount: roundCurrency(totalDecimal.minus(paidAmount)),
+      error: 'Payment amount cannot be negative',
+    };
+  }
+
+  if (paidAmount.greaterThan(totalDecimal)) {
+    return {
+      paidAmount: roundCurrency(paidAmount),
+      outstandingAmount: new Decimal(0),
+      error:
+        'Payment exceeds the sale total. Collect any extra amount as cash change (cash received) instead of overpaying the recorded payment.',
+    };
+  }
+
+  return {
+    paidAmount: roundCurrency(paidAmount),
+    outstandingAmount: roundCurrency(totalDecimal.minus(paidAmount)),
+    error: null,
+  };
+}
+
+/**
+ * H1: Shared customer-credit eligibility rules.
+ *
+ * Single source of truth used by BOTH the checkout service (pre-validation)
+ * and sale creation (inside the transaction) so there is exactly one credit
+ * policy, with the historical error messages preserved.
+ */
+export function validateCustomerCredit(
+  customer: {
+    status?: string | null;
+    creditLimit: number | Decimal | null;
+    currentBalance: number | Decimal | null;
+  },
+  outstandingAmount: number | Decimal
+): { ok: false; error: string; newBalance: Decimal } | { ok: true; error: null; newBalance: Decimal } {
+  const outstanding = toDecimal(outstandingAmount);
+  const currentBalance = toDecimal(customer.currentBalance);
+  const newBalance = roundCurrency(currentBalance.plus(outstanding));
+
+  if (customer.status !== 'ACTIVE') {
+    return {
+      ok: false,
+      error: 'Cannot create credit sale for inactive customer',
+      newBalance,
+    };
+  }
+
+  const creditLimit = toDecimal(customer.creditLimit);
+
+  if (creditLimit.equals(0)) {
+    return {
+      ok: false,
+      error: 'Customer has no credit limit configured',
+      newBalance,
+    };
+  }
+
+  if (newBalance.greaterThan(creditLimit)) {
+    return {
+      ok: false,
+      error:
+        `Credit limit exceeded. Current balance: Rs. ${currentBalance.toFixed(2)}, ` +
+        `Credit limit: Rs. ${creditLimit.toFixed(2)}, ` +
+        `Requested credit: Rs. ${outstanding.toFixed(2)}`,
+      newBalance,
+    };
+  }
+
+  return { ok: true, error: null, newBalance };
+}
+
+/**
  * Apply sale-level discount to cart
  */
 export function applySaleDiscount(
