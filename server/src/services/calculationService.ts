@@ -162,6 +162,59 @@ export function calculateCartTotals(items: CartItem[]): CalculationResult {
 }
 
 /**
+ * H2: THE authoritative sale-total calculation for POS checkout.
+ *
+ * Single source of truth for combining item totals with an order-level
+ * discount, used by checkoutService. The POS client (apps/pos/src/lib/totals.ts)
+ * implements this exact model and is pinned to it by server tests
+ * (tests/h2-totals-parity.test.ts) so the two can never silently diverge.
+ *
+ * Model (existing business rules, unchanged):
+ *   item tax base   = unitPrice x quantity - item discount      (order
+ *                     discount does NOT reduce the tax base)
+ *   taxAmount       = sum of item taxes (exact, no per-line rounding)
+ *   order discount  = PERCENTAGE: subtotal x value/100 (subtotal is the
+ *                     pre-item-discount sum) | FIXED: value
+ *   total           = subtotal - item discounts - order discount + taxAmount
+ *   rounding        = single ROUND_HALF_UP to 2dp per stored field
+ */
+export interface OrderDiscountInput {
+  discountType: 'PERCENTAGE' | 'FIXED';
+  discountValue: number;
+}
+
+export interface SaleTotalsResult {
+  subtotal: Decimal;
+  discountAmount: Decimal;
+  taxAmount: Decimal;
+  total: Decimal;
+}
+
+export function calculateCartTotalsWithOrderDiscount(
+  items: CartItem[],
+  orderDiscount?: OrderDiscountInput
+): SaleTotalsResult {
+  const calculation = calculateCartTotals(items);
+
+  let saleDiscountAmount = new Decimal(0);
+  let finalTotal = calculation.total;
+
+  if (orderDiscount) {
+    saleDiscountAmount = orderDiscount.discountType === 'PERCENTAGE'
+      ? calculation.subtotal.times(toDecimal(orderDiscount.discountValue).dividedBy(100))
+      : toDecimal(orderDiscount.discountValue);
+    finalTotal = calculation.total.minus(saleDiscountAmount);
+  }
+
+  return {
+    subtotal: roundCurrency(calculation.subtotal),
+    discountAmount: roundCurrency(calculation.discountAmount.plus(saleDiscountAmount)),
+    taxAmount: roundCurrency(calculation.taxAmount),
+    total: roundCurrency(finalTotal),
+  };
+}
+
+/**
  * Calculate cash payment change
  */
 export function calculateCashChange(
@@ -199,6 +252,105 @@ export function validatePayment(
     paidAmount,
     remaining: remaining.lessThan(0) ? new Decimal(0) : remaining,
   };
+}
+
+/**
+ * H1: Authoritative payment breakdown for a sale.
+ *
+ * Sums the tendered payment lines with Decimal arithmetic and derives the
+ * outstanding (credit) amount so the financial invariant always holds:
+ *
+ *   sale total = paid amount + outstanding credit
+ *
+ * Overpayment is not accepted here — the only supported way to hand the
+ * cashier more money than the total is CASH change (cashReceived greater
+ * than the tendered payment amount), which never makes the recorded
+ * payment exceed the total. Returns a validation error instead of
+ * silently inventing financial state.
+ */
+export function validateSalePayments(
+  total: number | Decimal,
+  payments: Array<{ amount: number | Decimal }>
+): { paidAmount: Decimal; outstandingAmount: Decimal; error: string | null } {
+  const totalDecimal = roundCurrency(toDecimal(total));
+  const paidAmount = payments.reduce(
+    (sum, payment) => sum.plus(toDecimal(payment.amount)),
+    new Decimal(0)
+  );
+
+  if (paidAmount.isNegative()) {
+    return {
+      paidAmount: roundCurrency(paidAmount),
+      outstandingAmount: roundCurrency(totalDecimal.minus(paidAmount)),
+      error: 'Payment amount cannot be negative',
+    };
+  }
+
+  if (paidAmount.greaterThan(totalDecimal)) {
+    return {
+      paidAmount: roundCurrency(paidAmount),
+      outstandingAmount: new Decimal(0),
+      error:
+        'Payment exceeds the sale total. Collect any extra amount as cash change (cash received) instead of overpaying the recorded payment.',
+    };
+  }
+
+  return {
+    paidAmount: roundCurrency(paidAmount),
+    outstandingAmount: roundCurrency(totalDecimal.minus(paidAmount)),
+    error: null,
+  };
+}
+
+/**
+ * H1: Shared customer-credit eligibility rules.
+ *
+ * Single source of truth used by BOTH the checkout service (pre-validation)
+ * and sale creation (inside the transaction) so there is exactly one credit
+ * policy, with the historical error messages preserved.
+ */
+export function validateCustomerCredit(
+  customer: {
+    status?: string | null;
+    creditLimit: number | Decimal | null;
+    currentBalance: number | Decimal | null;
+  },
+  outstandingAmount: number | Decimal
+): { ok: false; error: string; newBalance: Decimal } | { ok: true; error: null; newBalance: Decimal } {
+  const outstanding = toDecimal(outstandingAmount);
+  const currentBalance = toDecimal(customer.currentBalance);
+  const newBalance = roundCurrency(currentBalance.plus(outstanding));
+
+  if (customer.status !== 'ACTIVE') {
+    return {
+      ok: false,
+      error: 'Cannot create credit sale for inactive customer',
+      newBalance,
+    };
+  }
+
+  const creditLimit = toDecimal(customer.creditLimit);
+
+  if (creditLimit.equals(0)) {
+    return {
+      ok: false,
+      error: 'Customer has no credit limit configured',
+      newBalance,
+    };
+  }
+
+  if (newBalance.greaterThan(creditLimit)) {
+    return {
+      ok: false,
+      error:
+        `Credit limit exceeded. Current balance: Rs. ${currentBalance.toFixed(2)}, ` +
+        `Credit limit: Rs. ${creditLimit.toFixed(2)}, ` +
+        `Requested credit: Rs. ${outstanding.toFixed(2)}`,
+      newBalance,
+    };
+  }
+
+  return { ok: true, error: null, newBalance };
 }
 
 /**

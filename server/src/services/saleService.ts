@@ -1,6 +1,6 @@
 import prisma from '../lib/prisma.js';
 import { createAuditLog, AuditActions } from './auditService.js';
-import { toDecimal } from './calculationService.js';
+import { toDecimal, validateSalePayments, validateCustomerCredit } from './calculationService.js';
 import { eventEmitter } from '../realtime/eventEmitter.js';
 import { RealtimeEvents } from '../realtime/types.js';
 
@@ -43,8 +43,8 @@ export interface CreateSaleInput {
 /**
  * Generate next sale number
  */
-async function generateSaleNumber(businessId: string): Promise<string> {
-  const latest = await prisma.sale.findFirst({
+async function generateSaleNumber(businessId: string, db: typeof prisma): Promise<string> {
+  const latest = await db.sale.findFirst({
     where: { businessId },
     orderBy: { createdAt: 'desc' },
     select: { saleNumber: true },
@@ -63,15 +63,31 @@ async function generateSaleNumber(businessId: string): Promise<string> {
 
 /**
  * Create a completed sale
+ *
+ * H1: supports full payment, partial payment and full credit sales.
+ * The financial invariant `total = amountPaid + outstandingAmount` is
+ * derived here from the tendered payment lines (Decimal arithmetic) rather
+ * than trusted from the caller, so it can never silently diverge. A credit
+ * portion (outstanding > 0) requires a customer and is validated against
+ * the shared credit rules (status, credit limit) inside the transaction —
+ * any failure rolls back the complete sale (items, payments, inventory,
+ * movements, ledger and customer balance).
  */
 export async function createSale(
   input: CreateSaleInput,
   ipAddress?: string,
-  userAgent?: string
+  userAgent?: string,
+  deps?: {
+    prisma?: typeof prisma;
+    audit?: typeof createAuditLog;
+  }
 ) {
+  const db = deps?.prisma ?? prisma;
+  const audit = deps?.audit ?? createAuditLog;
+
   // Check for idempotency - prevent duplicate sales
   if (input.idempotencyKey) {
-    const existing = await prisma.sale.findUnique({
+    const existing = await db.sale.findUnique({
       where: { idempotencyKey: input.idempotencyKey },
     });
 
@@ -81,7 +97,7 @@ export async function createSale(
   }
 
   // Validate branch
-  const branch = await prisma.branch.findFirst({
+  const branch = await db.branch.findFirst({
     where: { id: input.branchId, businessId: input.businessId },
   });
 
@@ -90,7 +106,7 @@ export async function createSale(
   }
 
   // Validate cashier
-  const cashier = await prisma.user.findFirst({
+  const cashier = await db.user.findFirst({
     where: { id: input.cashierId, businessId: input.businessId, isActive: true },
   });
 
@@ -100,7 +116,7 @@ export async function createSale(
 
   // Validate items exist and are active
   for (const item of input.items) {
-    const product = await prisma.product.findFirst({
+    const product = await db.product.findFirst({
       where: { id: item.productId, businessId: input.businessId, isActive: true },
     });
 
@@ -109,7 +125,7 @@ export async function createSale(
     }
 
     if (item.variantId) {
-      const variant = await prisma.productVariant.findFirst({
+      const variant = await db.productVariant.findFirst({
         where: { id: item.variantId, productId: item.productId, isActive: true },
       });
 
@@ -141,20 +157,37 @@ export async function createSale(
     }
   }
 
-  // Verify total payment matches sale total
-  const totalPaid = input.payments.reduce((sum, p) => sum + p.amount, 0);
-  const totalDecimal = toDecimal(input.total);
-  const paidDecimal = toDecimal(totalPaid);
+  // H1: derive the authoritative paid/outstanding breakdown from the
+  // tendered payment lines (Decimal-only). Rejects overpayment (only cash
+  // change supports handing over more money than the total) and keeps the
+  // invariant total = amountPaid + outstandingAmount.
+  const paymentBreakdown = validateSalePayments(input.total, input.payments);
+  if (paymentBreakdown.error) {
+    throw new Error(paymentBreakdown.error);
+  }
+  const amountPaid = paymentBreakdown.paidAmount;
+  const outstandingAmount = paymentBreakdown.outstandingAmount;
 
-  if (!totalDecimal.equals(paidDecimal)) {
-    throw new Error('Payment total does not match sale total');
+  // Caller-supplied values (if any) must agree with the tendered payments —
+  // prevents any caller from writing inconsistent financial records.
+  if (input.amountPaid !== undefined && !toDecimal(input.amountPaid).equals(amountPaid)) {
+    throw new Error('amountPaid does not match the tendered payment lines for this sale');
+  }
+  if (input.outstandingAmount !== undefined && !toDecimal(input.outstandingAmount).equals(outstandingAmount)) {
+    throw new Error('outstandingAmount does not match the tendered payment lines for this sale');
+  }
+
+  // Credit portion requires a customer account (validated against credit
+  // rules inside the transaction below, immediately before the ledger write).
+  if (outstandingAmount.greaterThan(0) && !input.customerId) {
+    throw new Error('A customer account is required for partial payment or credit sales');
   }
 
   // Generate sale number
-  const saleNumber = await generateSaleNumber(input.businessId);
+  const saleNumber = await generateSaleNumber(input.businessId, db);
 
   // Create sale in a transaction
-  const sale = await prisma.$transaction(async (tx) => {
+  const sale = await db.$transaction(async (tx) => {
     // Create sale
     const newSale = await tx.sale.create({
       data: {
@@ -169,8 +202,8 @@ export async function createSale(
         discountValue: input.discountValue,
         taxAmount: input.taxAmount || 0,
         total: input.total,
-        amountPaid: input.amountPaid || input.total,
-        outstandingAmount: input.outstandingAmount || 0,
+        amountPaid,
+        outstandingAmount,
         customerId: input.customerId,
         cashierId: input.cashierId,
         shiftId: input.shiftId,
@@ -262,8 +295,10 @@ export async function createSale(
       });
     }
 
-    // Create ledger entry for credit sales
-    if (input.customerId && input.outstandingAmount && input.outstandingAmount > 0) {
+    // Create ledger entry for credit sales (H1: outstanding is the derived
+    // credit portion of this sale; credit rules enforced here inside the
+    // transaction so the balance can never be corrupted by a partial write)
+    if (input.customerId && outstandingAmount.greaterThan(0)) {
       const customer = await tx.customer.findUnique({
         where: { id: input.customerId },
       });
@@ -272,8 +307,11 @@ export async function createSale(
         throw new Error('Customer not found');
       }
 
-      const previousBalance = toDecimal(customer.currentBalance);
-      const newBalance = previousBalance.plus(toDecimal(input.outstandingAmount));
+      const creditCheck = validateCustomerCredit(customer, outstandingAmount);
+      if (!creditCheck.ok) {
+        throw new Error(creditCheck.error);
+      }
+      const newBalance = creditCheck.newBalance;
 
       await tx.customerLedger.create({
         data: {
@@ -283,7 +321,7 @@ export async function createSale(
           referenceType: 'SALE',
           referenceId: newSale.id,
           description: `Credit sale ${saleNumber}`,
-          debit: input.outstandingAmount,
+          debit: outstandingAmount,
           credit: 0,
           balance: newBalance,
           userId: input.cashierId,
@@ -302,7 +340,7 @@ export async function createSale(
   });
 
   // Audit log
-  await createAuditLog({
+  await audit({
     businessId: input.businessId,
     userId: input.cashierId,
     action: AuditActions.SALE_CREATED,
@@ -312,6 +350,8 @@ export async function createSale(
       saleNumber: sale.saleNumber,
       total: input.total,
       paymentMethods: input.payments.map(p => p.paymentMethod),
+      amountPaid: amountPaid.toFixed(2),
+      outstandingAmount: outstandingAmount.toFixed(2),
     },
     ipAddress,
     userAgent,

@@ -26,9 +26,17 @@ export default function Backups() {
   };
 
   const restoreBackup = async (id: string) => {
-    if (!confirm('Restore this backup? This will overwrite current data.')) return;
-    try { await api.post(`/backups/${id}/restore`); alert('Restore started'); }
-    catch (err: any) { alert(err.response?.data?.error?.message || 'Failed'); }
+    if (!confirm('RESTORE THIS BACKUP?\n\nAll current data for this business will be REPLACED with the backup snapshot. Anything created after the backup will be lost. This cannot be undone.')) return;
+    try {
+      const { data } = await api.post(`/backups/${id}/restore`, { confirm: true });
+      if (data?.data?.restored) {
+        alert(`Restore completed: ${data.data.restoredRows ?? 0} rows across ${data.data.tableCount ?? 0} tables restored.`);
+        loadBackups();
+      } else {
+        alert(data?.data?.message || 'Restore finished (no data was changed).');
+      }
+    }
+    catch (err: any) { alert(err.response?.data?.error?.message || 'Restore failed — no data was changed.'); }
   };
 
   const deleteBackup = async (id: string) => {

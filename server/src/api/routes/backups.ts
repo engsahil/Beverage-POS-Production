@@ -195,6 +195,10 @@ router.post('/:id/retry', authorize('backup.manage'), async (req: Request, res: 
 /**
  * POST /backups/:id/restore
  * Restore a backup
+ *
+ * Destructive operation: replaces the business's current data with the
+ * backup snapshot inside a single transaction. Requires an explicit
+ * confirmation flag ({ confirm: true }) from the caller.
  */
 router.post('/:id/restore', authorize('backup.manage'), async (req: Request, res: Response) => {
   try {
@@ -211,17 +215,31 @@ router.post('/:id/restore', authorize('backup.manage'), async (req: Request, res
       backupId,
       businessId: req.user.businessId,
       userId: req.user.sub,
+      confirm: req.body?.confirm === true,
       ipAddress,
       userAgent,
     });
 
+    // success:true is only returned after the data restore actually
+    // completed and committed (see backupRestore.performRestore).
     res.json({ success: true, data: result });
   } catch (error) {
-    res.status(400).json({
+    const restoreError = error as { code?: string; message?: string };
+    const code = restoreError?.code;
+    const statusCode =
+      code === 'BACKUP_NOT_FOUND' ? 404
+      : code === 'CONFIRMATION_REQUIRED' || code === 'CHECKSUM_MISMATCH' ||
+        code === 'INVALID_BACKUP_FORMAT' || code === 'UNSUPPORTED_SCHEMA_VERSION' ||
+        code === 'BUSINESS_MISMATCH' || code === 'NOT_RESTORABLE_STATE' ||
+        code === 'MISSING_FILE_INFO' || code === 'BACKUP_DECOMPRESSION_FAILED' ? 400
+      : 500;
+
+    res.status(statusCode).json({
       success: false,
+      restored: false,
       error: {
-        code: 'BACKUP_RESTORE_ERROR',
-        message: error instanceof Error ? error.message : 'Failed to restore backup',
+        code: code || 'BACKUP_RESTORE_ERROR',
+        message: restoreError instanceof Error ? restoreError.message : 'Failed to restore backup',
       },
     });
   }

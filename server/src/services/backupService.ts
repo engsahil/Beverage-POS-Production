@@ -11,6 +11,7 @@ import crypto from 'crypto';
 import prisma from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
 import { getStorageProvider } from './storage/index.js';
+import { performRestore } from './backupRestore.js';
 import { createAuditLog, AuditActions } from './auditService.js';
 
 const gzip = promisify(gzipCallback);
@@ -652,117 +653,22 @@ export async function deleteBackup(backupId: string, businessId: string, userId:
 // Restore Backup
 // ==========================================
 
-export async function restoreBackup(input: RestoreBackupInput) {
-  const { backupId, businessId, userId, ipAddress, userAgent } = input;
-  const storage = getStorageProvider();
-
-  // 1. Find backup and verify ownership
-  const backup = await prisma.cloudBackup.findFirst({
-    where: { id: backupId, businessId },
+export async function restoreBackup(input: RestoreBackupInput & { confirm?: boolean }) {
+  // C3: delegate to the real restore implementation (backupRestore.ts).
+  // The previous implementation only verified the archive and reported
+  // success without touching the database. Restore semantics now:
+  //   * requires explicit confirm === true (destructive operation)
+  //   * verifies checksum + structure, then replaces the business data
+  //     inside a single transaction
+  //   * reports success only after a committed, completed data restore
+  return performRestore({
+    backupId: input.backupId,
+    businessId: input.businessId,
+    userId: input.userId,
+    confirm: input.confirm === true,
+    ipAddress: input.ipAddress,
+    userAgent: input.userAgent,
   });
-
-  if (!backup) {
-    throw new Error('Backup not found');
-  }
-
-  if (!['COMPLETED', 'VERIFIED'].includes(backup.status)) {
-    throw new Error('Backup is not in a restorable state');
-  }
-
-  if (!backup.filePath || !backup.checksum) {
-    throw new Error('Backup file information missing');
-  }
-
-  // 2. Audit: restore requested
-  await createAuditLog({
-    businessId,
-    userId,
-    action: AuditActions.BACKUP_RESTORED,
-    entityType: 'cloud_backup',
-    entityId: backupId,
-    newValues: { action: 'RESTORE_REQUESTED', backupNumber: backup.backupNumber },
-    ipAddress,
-    userAgent,
-  });
-
-  try {
-    // 3. Download backup
-    logger.info('Downloading backup for restore', { backupId });
-    const compressed = await storage.download(backup.filePath);
-
-    // 4. Verify checksum
-    const actualChecksum = crypto.createHash('sha256').update(compressed).digest('hex');
-    if (actualChecksum !== backup.checksum) {
-      throw new Error('Backup integrity check failed: checksum mismatch');
-    }
-
-    // 5. Decompress
-    const decompressed = await gunzip(compressed) as Buffer;
-    const exportData = JSON.parse(decompressed.toString('utf-8'));
-
-    // 6. Verify format
-    if (!exportData.version || !exportData.data) {
-      throw new Error('Invalid backup format');
-    }
-
-    // 7. Verify schema compatibility
-    if (exportData.schemaVersion !== 'phase19') {
-      throw new Error(`Incompatible backup schema: ${exportData.schemaVersion}. Expected: phase19`);
-    }
-
-    // 8. Verify business ID matches
-    if (exportData.data.business?.id !== businessId) {
-      throw new Error('Backup does not belong to this business');
-    }
-
-    // 9. Mark backup as restored
-    await prisma.cloudBackup.update({
-      where: { id: backupId },
-      data: {
-        restoredAt: new Date(),
-        restoredBy: userId,
-      },
-    });
-
-    // Note: Actual data restoration would require careful handling
-    // (e.g., upsert vs overwrite, handling conflicts, etc.)
-    // For now, we report success but log that full restore needs manual intervention
-    logger.info('Backup restore metadata verified successfully', { backupId, businessId });
-
-    await createAuditLog({
-      businessId,
-      userId,
-      action: AuditActions.BACKUP_RESTORED,
-      entityType: 'cloud_backup',
-      entityId: backupId,
-      newValues: { action: 'RESTORE_COMPLETED', backupNumber: backup.backupNumber },
-      ipAddress,
-      userAgent,
-    });
-
-    return {
-      success: true,
-      backupId,
-      backupNumber: backup.backupNumber,
-      verified: true,
-      message: 'Backup verified and ready for restore. Data restoration requires admin confirmation.',
-    };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    
-    await createAuditLog({
-      businessId,
-      userId,
-      action: 'BACKUP_RESTORE_FAILED',
-      entityType: 'cloud_backup',
-      entityId: backupId,
-      newValues: { error: errorMessage },
-      ipAddress,
-      userAgent,
-    });
-
-    throw new Error(`Restore failed: ${errorMessage}`);
-  }
 }
 
 // ==========================================

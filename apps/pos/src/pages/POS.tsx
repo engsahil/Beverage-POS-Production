@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import api from '../api';
+import { computeCartTotals } from '../lib/totals';
 import ShiftManager from '../components/ShiftManager';
 import CustomerSelector from '../components/CustomerSelector';
 import ReceiptPreview from '../components/ReceiptPreview';
@@ -257,21 +258,30 @@ export default function POS() {
     setCart(cart.filter((item) => item.productId !== productId));
   };
 
-  const subtotal = cart.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0);
-  const itemDiscounts = cart.reduce((sum, item) => sum + item.discountAmount, 0);
-  const orderDiscountAmount =
-    orderDiscountType === 'PERCENTAGE'
-      ? (subtotal - itemDiscounts) * (orderDiscount / 100)
-      : orderDiscount;
-  const totalDiscount = itemDiscounts + orderDiscountAmount;
-  const taxableAmount = Math.max(0, subtotal - totalDiscount);
-  const totalTax = cart.reduce((sum, item) => {
-    const itemSubtotal = item.quantity * item.unitPrice;
-    const itemAfterDiscount =
-      itemSubtotal - item.discountAmount - orderDiscountAmount * (itemSubtotal / subtotal || 0);
-    return sum + itemAfterDiscount * (item.taxRate / 100);
-  }, 0);
-  const total = taxableAmount + totalTax;
+  // H2: cart totals come from the shared authoritative model (lib/totals.ts),
+  // which mirrors the server's calculation exactly — tax base is the item
+  // amount net of item discounts only, and the order discount is applied to
+  // the pre-item-discount subtotal after tax. The old inline formula
+  // allocated the order discount into the tax base and used a different
+  // percentage base, so tax + order-discount carts displayed a different
+  // total than the server charged (checkout rejections / unintended credit).
+  const {
+    subtotal,
+    itemDiscounts,
+    orderDiscountAmount,
+    totalDiscount,
+    taxableAmount,
+    totalTax,
+    total,
+  } = computeCartTotals(
+    cart.map((item) => ({
+      unitPrice: item.unitPrice,
+      quantity: item.quantity,
+      discountAmount: item.discountAmount,
+      taxRate: item.taxRate,
+    })),
+    orderDiscount > 0 ? { discountType: orderDiscountType, discountValue: orderDiscount } : undefined
+  );
 
   const handleProceedToPayment = () => {
     if (!activeShift) {
@@ -318,15 +328,28 @@ export default function POS() {
     setError('');
 
     const totalPaid = payments.reduce((sum, p) => sum + p.amount, 0);
-    if (totalPaid < total) {
+    if (totalPaid > total) {
       setError(
-        `Payment balance (Rs. ${totalPaid.toFixed(2)}) is less than grand total (Rs. ${total.toFixed(2)})`
+        `Tendered amount (Rs. ${totalPaid.toFixed(2)}) exceeds the grand total (Rs. ${total.toFixed(2)}). Use "Cash Given" to return change.`
       );
       setLoading(false);
       return;
     }
+    const creditPortion = Math.round((total - totalPaid) * 100) / 100;
+    if (creditPortion > 0 && !selectedCustomer) {
+      setError(
+        `Payment balance (Rs. ${totalPaid.toFixed(2)}) is less than grand total (Rs. ${total.toFixed(2)}). Select a customer to place the remaining Rs. ${creditPortion.toFixed(2)} on their account.`
+      );
+      setLoading(false);
+      return;
+    }
+    if (creditPortion > 0 && selectedCustomer && !confirm(`CREDIT SALE: Rs. ${creditPortion.toFixed(2)} will be added to ${selectedCustomer.name}'s account as outstanding balance. Continue?`)) {
+      setLoading(false);
+      return;
+    }
 
-    const paymentData = payments.map((p) => ({
+    // Zero-amount lines are not real tenders (full credit sends no payments)
+    const paymentData = payments.filter((p) => p.amount > 0).map((p) => ({
       paymentMethod: p.method,
       amount: p.amount,
       referenceNumber: p.referenceNumber || null,
@@ -1262,6 +1285,12 @@ export default function POS() {
                       <span className="mono">Rs. {Math.max(0, change).toFixed(2)}</span>
                     </div>
                   )}
+                  {totalPaid < total && selectedCustomer && (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, fontWeight: 600, color: '#b45309' }}>
+                      <span>Credit to {selectedCustomer.name}'s account:</span>
+                      <span className="mono">Rs. {(total - totalPaid).toFixed(2)}</span>
+                    </div>
+                  )}
                 </div>
               );
             })()}
@@ -1285,16 +1314,16 @@ export default function POS() {
               </button>
               <button
                 onClick={handleCheckout}
-                disabled={loading || payments.reduce((s, p) => s + p.amount, 0) < total}
+                disabled={loading || (payments.reduce((s, p) => s + p.amount, 0) < total && !selectedCustomer)}
                 style={{
                   flex: 2,
                   padding: '10px 20px',
-                  background: loading || payments.reduce((s, p) => s + p.amount, 0) < total ? '#cbd5e1' : 'var(--primary)',
+                  background: loading || (payments.reduce((s, p) => s + p.amount, 0) < total && !selectedCustomer) ? '#cbd5e1' : 'var(--primary)',
                   color: '#ffffff',
                   borderRadius: 'var(--radius-sm)',
                   fontSize: 14,
                   fontWeight: 700,
-                  cursor: loading || payments.reduce((s, p) => s + p.amount, 0) < total ? 'not-allowed' : 'pointer',
+                  cursor: loading || (payments.reduce((s, p) => s + p.amount, 0) < total && !selectedCustomer) ? 'not-allowed' : 'pointer',
                 }}
               >
                 {loading ? 'Completing Transaction...' : 'Complete & Print Receipt'}

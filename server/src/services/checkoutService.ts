@@ -2,8 +2,11 @@ import prisma from '../lib/prisma.js';
 import { Decimal } from '@prisma/client/runtime/library.js';
 import {
   calculateCartTotals,
+  calculateCartTotalsWithOrderDiscount,
   calculateCashChange,
   validatePayment,
+  validateSalePayments,
+  validateCustomerCredit,
   isDiscountAllowed,
   toDecimal,
   roundCurrency,
@@ -52,7 +55,8 @@ export interface CheckoutValidationResult {
  * Validate checkout input before processing
  */
 export async function validateCheckout(
-  input: CheckoutCartInput
+  input: CheckoutCartInput,
+  db: typeof prisma = prisma
 ): Promise<CheckoutValidationResult> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -68,7 +72,7 @@ export async function validateCheckout(
   }
 
   for (const item of input.items) {
-    const product = await prisma.product.findFirst({
+    const product = await db.product.findFirst({
       where: { id: item.productId, businessId: input.businessId },
       include: { variants: true },
     });
@@ -110,7 +114,7 @@ export async function validateCheckout(
       errors.push(`Quantity must be greater than zero for ${product.name}`);
     }
 
-    const inventory = await prisma.inventory.findFirst({
+    const inventory = await db.inventory.findFirst({
       where: {
         businessId: input.businessId,
         branchId: input.branchId,
@@ -162,14 +166,42 @@ export async function validateCheckout(
 }
 
 /**
+ * H1: Compute per-tender cash change for the checkout payment lines.
+ *
+ * Change is a per tender line concept: cash given minus the amount tendered
+ * on THAT line. (It was previously computed against the whole sale total,
+ * which wrongly rejected partial cash payments on credit/partial sales.)
+ * Pure function — no database access.
+ */
+export function applyCashChanges(payments: CheckoutCartInput['payments']) {
+  return payments.map(payment => {
+    if (payment.paymentMethod === 'CASH' && payment.cashReceived) {
+      const { change, isValid } = calculateCashChange(payment.amount, payment.cashReceived);
+      if (!isValid) throw new Error('Insufficient cash received');
+      return { ...payment, cashChange: Number(roundCurrency(change)) };
+    }
+    return payment;
+  });
+}
+
+/**
  * Process checkout
  */
 export async function processCheckout(
   input: CheckoutCartInput,
   ipAddress?: string,
-  userAgent?: string
+  userAgent?: string,
+  deps?: {
+    prisma?: typeof prisma;
+    createSale?: typeof createSale;
+  }
 ) {
-  const validation = await validateCheckout(input);
+  // H2: test seams (same pattern as saleService.createSale) — production
+  // defaults are the real singletons.
+  const db = deps?.prisma ?? prisma;
+  const createSaleFn = deps?.createSale ?? createSale;
+
+  const validation = await validateCheckout(input, db);
   if (!validation.isValid) {
     throw new Error(`Validation failed: ${validation.errors.join(', ')}`);
   }
@@ -182,11 +214,11 @@ export async function processCheckout(
     let originalPrice: Decimal | undefined;
 
     if (item.variantId) {
-      const variant = await prisma.productVariant.findUnique({ where: { id: item.variantId } });
+      const variant = await db.productVariant.findUnique({ where: { id: item.variantId } });
       if (!variant) throw new Error(`Variant ${item.variantId} not found`);
       unitPrice = toDecimal(variant.sellingPrice);
     } else {
-      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      const product = await db.product.findUnique({ where: { id: item.productId } });
       if (!product) throw new Error(`Product ${item.productId} not found`);
       unitPrice = toDecimal(product.sellingPrice);
     }
@@ -211,7 +243,7 @@ export async function processCheckout(
       });
     }
 
-    const product = await prisma.product.findUnique({ where: { id: item.productId } });
+    const product = await db.product.findUnique({ where: { id: item.productId } });
     let itemDiscountAmount = toDecimal(item.discountAmount || 0);
 
     if (item.discountAmount && product && product.discountAllowed) {
@@ -253,76 +285,59 @@ export async function processCheckout(
     });
   }
 
-  const calculation = calculateCartTotals(cartItems);
-  let saleDiscountAmount = new Decimal(0);
-  let finalTotal = calculation.total;
+  // H2: single authoritative calculation (shared with the POS client model)
+  const { subtotal, discountAmount, taxAmount, total } =
+    calculateCartTotalsWithOrderDiscount(cartItems, input.saleDiscount);
 
-  if (input.saleDiscount) {
-    saleDiscountAmount = input.saleDiscount.discountType === 'PERCENTAGE'
-      ? calculation.subtotal.times(toDecimal(input.saleDiscount.discountValue).dividedBy(100))
-      : toDecimal(input.saleDiscount.discountValue);
-    finalTotal = calculation.total.minus(saleDiscountAmount);
-  }
-
-  const subtotal = roundCurrency(calculation.subtotal);
-  const discountAmount = roundCurrency(calculation.discountAmount.plus(saleDiscountAmount));
-  const taxAmount = roundCurrency(calculation.taxAmount);
-  const total = roundCurrency(finalTotal);
-
-  const paymentsWithChange = input.payments.map(payment => {
-    if (payment.paymentMethod === 'CASH' && payment.cashReceived) {
-      const { change, isValid } = calculateCashChange(total, payment.cashReceived);
-      if (!isValid) throw new Error('Insufficient cash received');
-      return { ...payment, cashChange: Number(roundCurrency(change)) };
-    }
-    return payment;
-  });
+  const paymentsWithChange = applyCashChanges(input.payments);
 
   const paymentValidation = validatePayment(total, paymentsWithChange);
-  
+
+  // H1: recorded payments must never exceed the sale total — handing the
+  // cashier more money than owed is only supported as CASH change
+  // (cashReceived > tendered amount), never as an overpaid payment record.
+  if (paymentValidation.paidAmount.greaterThan(total)) {
+    throw new Error(
+      'Payment exceeds the sale total. Collect any extra amount as cash change (cash received) instead of overpaying the recorded payment.'
+    );
+  }
+
   // Handle credit sales (when payment is less than total and customer is provided)
   let outstandingAmount = new Decimal(0);
   let amountPaid = total;
-  
+
   if (input.customerId && paymentValidation.remaining.greaterThan(0)) {
     // This is a credit sale
     outstandingAmount = paymentValidation.remaining;
     amountPaid = paymentValidation.paidAmount;
-    
-    // Validate customer credit limit
-    const customer = await prisma.customer.findFirst({
+
+    // Validate customer credit eligibility (shared rules, also re-checked
+    // inside the sale transaction)
+    const customer = await db.customer.findFirst({
       where: { id: input.customerId, businessId: input.businessId },
     });
-    
+
     if (!customer) {
       throw new Error('Customer not found');
     }
-    
-    if (customer.status !== 'ACTIVE') {
-      throw new Error('Cannot create credit sale for inactive customer');
-    }
-    
-    const creditLimit = toDecimal(customer.creditLimit);
-    const currentBalance = toDecimal(customer.currentBalance);
-    const newBalance = currentBalance.plus(outstandingAmount);
-    
-    if (creditLimit.equals(0)) {
-      throw new Error('Customer has no credit limit configured');
-    }
-    
-    if (newBalance.greaterThan(creditLimit)) {
-      throw new Error(
-        `Credit limit exceeded. Current balance: Rs. ${currentBalance.toFixed(2)}, ` +
-        `Credit limit: Rs. ${creditLimit.toFixed(2)}, ` +
-        `Requested credit: Rs. ${outstandingAmount.toFixed(2)}`
-      );
+
+    const creditCheck = validateCustomerCredit(customer, outstandingAmount);
+    if (!creditCheck.ok) {
+      throw new Error(creditCheck.error);
     }
   } else if (!paymentValidation.isValid) {
     // No customer provided and payment is insufficient - reject
     throw new Error(`Payment shortfall: ${paymentValidation.remaining.toFixed(2)}`);
   }
 
-  const sale = await createSale({
+  // H1: final reconciliation guard before any financial mutation — the
+  // tendered payments plus the outstanding credit must equal the sale total.
+  const reconciliation = validateSalePayments(total, paymentsWithChange);
+  if (reconciliation.error) {
+    throw new Error(reconciliation.error);
+  }
+
+  const sale = await createSaleFn({
     businessId: input.businessId,
     branchId: input.branchId,
     cashierId: input.cashierId,
@@ -355,22 +370,22 @@ export async function processCheckout(
 /**
  * Get checkout preview
  */
-export async function getCheckoutPreview(input: CheckoutCartInput) {
-  const validation = await validateCheckout(input);
+export async function getCheckoutPreview(input: CheckoutCartInput, db: typeof prisma = prisma) {
+  const validation = await validateCheckout(input, db);
   const cartItems: CartItem[] = [];
 
   for (const item of input.items) {
     let unitPrice: Decimal;
     if (item.variantId) {
-      const variant = await prisma.productVariant.findUnique({ where: { id: item.variantId } });
+      const variant = await db.productVariant.findUnique({ where: { id: item.variantId } });
       if (!variant) continue;
       unitPrice = toDecimal(item.overridePrice || variant.sellingPrice);
     } else {
-      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      const product = await db.product.findUnique({ where: { id: item.productId } });
       if (!product) continue;
       unitPrice = toDecimal(item.overridePrice || product.sellingPrice);
     }
-    const product = await prisma.product.findUnique({ where: { id: item.productId } });
+    const product = await db.product.findUnique({ where: { id: item.productId } });
     cartItems.push({
       productId: item.productId,
       variantId: item.variantId,
