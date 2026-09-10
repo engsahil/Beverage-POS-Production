@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import api from '../api';
+import { computeCartTotals } from '../lib/totals';
 import ShiftManager from '../components/ShiftManager';
 import CustomerSelector from '../components/CustomerSelector';
 import ReceiptPreview from '../components/ReceiptPreview';
@@ -257,21 +258,30 @@ export default function POS() {
     setCart(cart.filter((item) => item.productId !== productId));
   };
 
-  const subtotal = cart.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0);
-  const itemDiscounts = cart.reduce((sum, item) => sum + item.discountAmount, 0);
-  const orderDiscountAmount =
-    orderDiscountType === 'PERCENTAGE'
-      ? (subtotal - itemDiscounts) * (orderDiscount / 100)
-      : orderDiscount;
-  const totalDiscount = itemDiscounts + orderDiscountAmount;
-  const taxableAmount = Math.max(0, subtotal - totalDiscount);
-  const totalTax = cart.reduce((sum, item) => {
-    const itemSubtotal = item.quantity * item.unitPrice;
-    const itemAfterDiscount =
-      itemSubtotal - item.discountAmount - orderDiscountAmount * (itemSubtotal / subtotal || 0);
-    return sum + itemAfterDiscount * (item.taxRate / 100);
-  }, 0);
-  const total = taxableAmount + totalTax;
+  // H2: cart totals come from the shared authoritative model (lib/totals.ts),
+  // which mirrors the server's calculation exactly — tax base is the item
+  // amount net of item discounts only, and the order discount is applied to
+  // the pre-item-discount subtotal after tax. The old inline formula
+  // allocated the order discount into the tax base and used a different
+  // percentage base, so tax + order-discount carts displayed a different
+  // total than the server charged (checkout rejections / unintended credit).
+  const {
+    subtotal,
+    itemDiscounts,
+    orderDiscountAmount,
+    totalDiscount,
+    taxableAmount,
+    totalTax,
+    total,
+  } = computeCartTotals(
+    cart.map((item) => ({
+      unitPrice: item.unitPrice,
+      quantity: item.quantity,
+      discountAmount: item.discountAmount,
+      taxRate: item.taxRate,
+    })),
+    orderDiscount > 0 ? { discountType: orderDiscountType, discountValue: orderDiscount } : undefined
+  );
 
   const handleProceedToPayment = () => {
     if (!activeShift) {

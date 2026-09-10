@@ -162,6 +162,59 @@ export function calculateCartTotals(items: CartItem[]): CalculationResult {
 }
 
 /**
+ * H2: THE authoritative sale-total calculation for POS checkout.
+ *
+ * Single source of truth for combining item totals with an order-level
+ * discount, used by checkoutService. The POS client (apps/pos/src/lib/totals.ts)
+ * implements this exact model and is pinned to it by server tests
+ * (tests/h2-totals-parity.test.ts) so the two can never silently diverge.
+ *
+ * Model (existing business rules, unchanged):
+ *   item tax base   = unitPrice x quantity - item discount      (order
+ *                     discount does NOT reduce the tax base)
+ *   taxAmount       = sum of item taxes (exact, no per-line rounding)
+ *   order discount  = PERCENTAGE: subtotal x value/100 (subtotal is the
+ *                     pre-item-discount sum) | FIXED: value
+ *   total           = subtotal - item discounts - order discount + taxAmount
+ *   rounding        = single ROUND_HALF_UP to 2dp per stored field
+ */
+export interface OrderDiscountInput {
+  discountType: 'PERCENTAGE' | 'FIXED';
+  discountValue: number;
+}
+
+export interface SaleTotalsResult {
+  subtotal: Decimal;
+  discountAmount: Decimal;
+  taxAmount: Decimal;
+  total: Decimal;
+}
+
+export function calculateCartTotalsWithOrderDiscount(
+  items: CartItem[],
+  orderDiscount?: OrderDiscountInput
+): SaleTotalsResult {
+  const calculation = calculateCartTotals(items);
+
+  let saleDiscountAmount = new Decimal(0);
+  let finalTotal = calculation.total;
+
+  if (orderDiscount) {
+    saleDiscountAmount = orderDiscount.discountType === 'PERCENTAGE'
+      ? calculation.subtotal.times(toDecimal(orderDiscount.discountValue).dividedBy(100))
+      : toDecimal(orderDiscount.discountValue);
+    finalTotal = calculation.total.minus(saleDiscountAmount);
+  }
+
+  return {
+    subtotal: roundCurrency(calculation.subtotal),
+    discountAmount: roundCurrency(calculation.discountAmount.plus(saleDiscountAmount)),
+    taxAmount: roundCurrency(calculation.taxAmount),
+    total: roundCurrency(finalTotal),
+  };
+}
+
+/**
  * Calculate cash payment change
  */
 export function calculateCashChange(

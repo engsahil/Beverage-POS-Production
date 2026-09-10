@@ -2,6 +2,7 @@ import prisma from '../lib/prisma.js';
 import { Decimal } from '@prisma/client/runtime/library.js';
 import {
   calculateCartTotals,
+  calculateCartTotalsWithOrderDiscount,
   calculateCashChange,
   validatePayment,
   validateSalePayments,
@@ -54,7 +55,8 @@ export interface CheckoutValidationResult {
  * Validate checkout input before processing
  */
 export async function validateCheckout(
-  input: CheckoutCartInput
+  input: CheckoutCartInput,
+  db: typeof prisma = prisma
 ): Promise<CheckoutValidationResult> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -70,7 +72,7 @@ export async function validateCheckout(
   }
 
   for (const item of input.items) {
-    const product = await prisma.product.findFirst({
+    const product = await db.product.findFirst({
       where: { id: item.productId, businessId: input.businessId },
       include: { variants: true },
     });
@@ -112,7 +114,7 @@ export async function validateCheckout(
       errors.push(`Quantity must be greater than zero for ${product.name}`);
     }
 
-    const inventory = await prisma.inventory.findFirst({
+    const inventory = await db.inventory.findFirst({
       where: {
         businessId: input.businessId,
         branchId: input.branchId,
@@ -188,9 +190,18 @@ export function applyCashChanges(payments: CheckoutCartInput['payments']) {
 export async function processCheckout(
   input: CheckoutCartInput,
   ipAddress?: string,
-  userAgent?: string
+  userAgent?: string,
+  deps?: {
+    prisma?: typeof prisma;
+    createSale?: typeof createSale;
+  }
 ) {
-  const validation = await validateCheckout(input);
+  // H2: test seams (same pattern as saleService.createSale) — production
+  // defaults are the real singletons.
+  const db = deps?.prisma ?? prisma;
+  const createSaleFn = deps?.createSale ?? createSale;
+
+  const validation = await validateCheckout(input, db);
   if (!validation.isValid) {
     throw new Error(`Validation failed: ${validation.errors.join(', ')}`);
   }
@@ -203,11 +214,11 @@ export async function processCheckout(
     let originalPrice: Decimal | undefined;
 
     if (item.variantId) {
-      const variant = await prisma.productVariant.findUnique({ where: { id: item.variantId } });
+      const variant = await db.productVariant.findUnique({ where: { id: item.variantId } });
       if (!variant) throw new Error(`Variant ${item.variantId} not found`);
       unitPrice = toDecimal(variant.sellingPrice);
     } else {
-      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      const product = await db.product.findUnique({ where: { id: item.productId } });
       if (!product) throw new Error(`Product ${item.productId} not found`);
       unitPrice = toDecimal(product.sellingPrice);
     }
@@ -232,7 +243,7 @@ export async function processCheckout(
       });
     }
 
-    const product = await prisma.product.findUnique({ where: { id: item.productId } });
+    const product = await db.product.findUnique({ where: { id: item.productId } });
     let itemDiscountAmount = toDecimal(item.discountAmount || 0);
 
     if (item.discountAmount && product && product.discountAllowed) {
@@ -274,21 +285,9 @@ export async function processCheckout(
     });
   }
 
-  const calculation = calculateCartTotals(cartItems);
-  let saleDiscountAmount = new Decimal(0);
-  let finalTotal = calculation.total;
-
-  if (input.saleDiscount) {
-    saleDiscountAmount = input.saleDiscount.discountType === 'PERCENTAGE'
-      ? calculation.subtotal.times(toDecimal(input.saleDiscount.discountValue).dividedBy(100))
-      : toDecimal(input.saleDiscount.discountValue);
-    finalTotal = calculation.total.minus(saleDiscountAmount);
-  }
-
-  const subtotal = roundCurrency(calculation.subtotal);
-  const discountAmount = roundCurrency(calculation.discountAmount.plus(saleDiscountAmount));
-  const taxAmount = roundCurrency(calculation.taxAmount);
-  const total = roundCurrency(finalTotal);
+  // H2: single authoritative calculation (shared with the POS client model)
+  const { subtotal, discountAmount, taxAmount, total } =
+    calculateCartTotalsWithOrderDiscount(cartItems, input.saleDiscount);
 
   const paymentsWithChange = applyCashChanges(input.payments);
 
@@ -314,7 +313,7 @@ export async function processCheckout(
 
     // Validate customer credit eligibility (shared rules, also re-checked
     // inside the sale transaction)
-    const customer = await prisma.customer.findFirst({
+    const customer = await db.customer.findFirst({
       where: { id: input.customerId, businessId: input.businessId },
     });
 
@@ -338,7 +337,7 @@ export async function processCheckout(
     throw new Error(reconciliation.error);
   }
 
-  const sale = await createSale({
+  const sale = await createSaleFn({
     businessId: input.businessId,
     branchId: input.branchId,
     cashierId: input.cashierId,
@@ -371,22 +370,22 @@ export async function processCheckout(
 /**
  * Get checkout preview
  */
-export async function getCheckoutPreview(input: CheckoutCartInput) {
-  const validation = await validateCheckout(input);
+export async function getCheckoutPreview(input: CheckoutCartInput, db: typeof prisma = prisma) {
+  const validation = await validateCheckout(input, db);
   const cartItems: CartItem[] = [];
 
   for (const item of input.items) {
     let unitPrice: Decimal;
     if (item.variantId) {
-      const variant = await prisma.productVariant.findUnique({ where: { id: item.variantId } });
+      const variant = await db.productVariant.findUnique({ where: { id: item.variantId } });
       if (!variant) continue;
       unitPrice = toDecimal(item.overridePrice || variant.sellingPrice);
     } else {
-      const product = await prisma.product.findUnique({ where: { id: item.productId } });
+      const product = await db.product.findUnique({ where: { id: item.productId } });
       if (!product) continue;
       unitPrice = toDecimal(item.overridePrice || product.sellingPrice);
     }
-    const product = await prisma.product.findUnique({ where: { id: item.productId } });
+    const product = await db.product.findUnique({ where: { id: item.productId } });
     cartItems.push({
       productId: item.productId,
       variantId: item.variantId,
