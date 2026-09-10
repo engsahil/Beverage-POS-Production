@@ -471,9 +471,16 @@ export async function voidSale(
   userId: string,
   reason: string,
   ipAddress?: string,
-  userAgent?: string
+  userAgent?: string,
+  deps?: {
+    prisma?: typeof prisma;
+    audit?: typeof createAuditLog;
+  }
 ) {
-  const sale = await prisma.sale.findFirst({
+  const db = deps?.prisma ?? prisma;
+  const audit = deps?.audit ?? createAuditLog;
+
+  const sale = await db.sale.findFirst({
     where: { id: saleId, businessId },
     include: { items: true },
   });
@@ -486,24 +493,90 @@ export async function voidSale(
     throw new Error('Only completed sales can be voided');
   }
 
-  // Void in a transaction
-  const result = await prisma.$transaction(async (tx) => {
-    // Update sale status
-    const updatedSale = await tx.sale.update({
-      where: { id: saleId },
-      data: {
-        status: 'VOIDED',
-        voidReason: reason,
-        voidedAt: new Date(),
-        voidedBy: userId,
+  const voidedAt = new Date();
+  const voidData = {
+    status: 'VOIDED',
+    voidReason: reason,
+    voidedAt,
+    voidedBy: userId,
+  };
+
+  // Claim the completed sale and reverse all of its effects in one
+  // transaction. The conditional update is the concurrency guard: if two
+  // requests read COMPLETED concurrently, only one can claim the row and
+  // perform the inventory and ledger reversal.
+  const result = await db.$transaction(async (tx) => {
+    const claim = await tx.sale.updateMany({
+      where: {
+        id: saleId,
+        businessId,
+        status: 'COMPLETED',
       },
+      data: voidData,
     });
 
-    // Restore inventory for each item
+    if (claim.count !== 1) {
+      throw new Error('Only completed sales can be voided');
+    }
+
+    // A credit sale records only its outstanding portion in the customer
+    // ledger. A partial-payment sale therefore reverses (for example) 600,
+    // not the full 1000 sale total. The already-received Payment rows remain
+    // immutable historical sale tenders; this application has no separate
+    // sale-refund entity or automatic refund workflow.
+    const outstandingAmount = toDecimal(sale.outstandingAmount);
+    if (sale.customerId && outstandingAmount.greaterThan(0)) {
+      const customer = await tx.customer.findUnique({
+        where: { id: sale.customerId },
+      });
+
+      if (!customer || customer.businessId !== businessId) {
+        throw new Error('Customer not found');
+      }
+
+      const existingReversal = await tx.customerLedger.findFirst({
+        where: {
+          businessId,
+          customerId: sale.customerId,
+          referenceType: 'SALE_VOID',
+          referenceId: sale.id,
+        },
+      });
+
+      if (existingReversal) {
+        throw new Error('Credit sale void reversal already exists');
+      }
+
+      const previousBalance = toDecimal(customer.currentBalance);
+      const newBalance = previousBalance.minus(outstandingAmount);
+
+      await tx.customerLedger.create({
+        data: {
+          businessId,
+          customerId: sale.customerId,
+          ledgerDate: voidedAt,
+          referenceType: 'SALE_VOID',
+          referenceId: sale.id,
+          description: `Void credit sale ${sale.saleNumber}`,
+          debit: 0,
+          credit: outstandingAmount,
+          balance: newBalance,
+          userId,
+          notes: reason,
+        },
+      });
+
+      await tx.customer.update({
+        where: { id: sale.customerId },
+        data: { currentBalance: newBalance },
+      });
+    }
+
+    // Restore inventory according to the existing sale-void policy.
     for (const item of sale.items) {
       const inventory = await tx.inventory.findFirst({
         where: {
-          businessId: businessId,
+          businessId,
           branchId: sale.branchId,
           productId: item.productId,
           variantId: item.variantId || null,
@@ -525,7 +598,7 @@ export async function voidSale(
         // Create stock movement for void
         await tx.stockMovement.create({
           data: {
-            businessId: businessId,
+            businessId,
             branchId: sale.branchId,
             inventoryId: inventory.id,
             productId: item.productId,
@@ -543,11 +616,11 @@ export async function voidSale(
       }
     }
 
-    return updatedSale;
+    return { ...sale, ...voidData };
   });
 
   // Audit log
-  await createAuditLog({
+  await audit({
     businessId,
     userId,
     action: AuditActions.SALE_VOIDED,
@@ -560,7 +633,7 @@ export async function voidSale(
   });
 
   // Emit realtime event AFTER successful transaction and audit
-  const voidedByUser = await prisma.user.findUnique({
+  const voidedByUser = await db.user.findUnique({
     where: { id: userId },
     select: { fullName: true },
   });

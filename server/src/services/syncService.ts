@@ -16,6 +16,7 @@
 
 import prisma from '../lib/prisma.js';
 import * as checkoutService from './checkoutService.js';
+import * as saleService from './saleService.js';
 
 // ==========================================
 // Types
@@ -682,7 +683,11 @@ async function processExpenseCreate(
 }
 
 /**
- * Process sale void from offline queue
+ * Process sale void from offline queue.
+ *
+ * Keep offline voids on the same transactional path as the authenticated
+ * sales endpoint so customer-ledger reversals and inventory idempotency cannot
+ * diverge between online and synchronized operations.
  */
 async function processSaleVoid(
   businessId: string,
@@ -692,19 +697,19 @@ async function processSaleVoid(
   try {
     const payload = operation.payload as any;
 
-    // Find the sale - try by server ID first, then by sale number
+    // Find the sale - try by server ID first, then by sale number.
     let sale = null;
     if (payload.saleId) {
       sale = await prisma.sale.findFirst({
         where: { id: payload.saleId, businessId },
-        include: { items: true },
+        select: { id: true, saleNumber: true, status: true },
       });
     }
-    
+
     if (!sale && payload.saleNumber) {
       sale = await prisma.sale.findFirst({
         where: { saleNumber: payload.saleNumber, businessId },
-        include: { items: true },
+        select: { id: true, saleNumber: true, status: true },
       });
     }
 
@@ -719,7 +724,8 @@ async function processSaleVoid(
     }
 
     if (sale.status !== 'COMPLETED') {
-      // Already voided or refunded
+      // Preserve existing sync idempotency behavior for a previously voided
+      // or refunded sale. No financial mutation is performed here.
       return {
         operationId: operation.operationId,
         success: true,
@@ -729,67 +735,18 @@ async function processSaleVoid(
       };
     }
 
-    // Void the sale in a transaction
-    await prisma.$transaction(async (tx) => {
-      // Update sale status
-      await tx.sale.update({
-        where: { id: sale!.id },
-        data: {
-          status: 'VOIDED',
-          voidReason: payload.reason || 'Voided from offline POS',
-          voidedAt: new Date(),
-          voidedBy: userId,
-        },
-      });
-
-      // Restore inventory for each item
-      for (const item of sale!.items) {
-        const inventory = await tx.inventory.findFirst({
-          where: {
-            businessId,
-            branchId: sale!.branchId,
-            productId: item.productId,
-            variantId: item.variantId || null,
-          },
-        });
-
-        if (inventory) {
-          const newQty = Number(inventory.currentQuantity) + Number(item.quantity);
-          await tx.inventory.update({
-            where: { id: inventory.id },
-            data: {
-              currentQuantity: newQty,
-              lastMovementAt: new Date(),
-            },
-          });
-
-          // Create stock movement for void
-          await tx.stockMovement.create({
-            data: {
-              businessId,
-              branchId: sale!.branchId,
-              inventoryId: inventory.id,
-              productId: item.productId,
-              variantId: item.variantId,
-              movementType: 'SALE_VOID',
-              quantity: Number(item.quantity),
-              previousQuantity: Number(inventory.currentQuantity),
-              resultingQuantity: newQty,
-              referenceType: 'sale',
-              referenceId: sale!.id,
-              reason: `Sale voided: ${payload.reason || 'Voided from offline POS'}`,
-              performedBy: userId,
-            },
-          });
-        }
-      }
-    });
+    const voidedSale = await saleService.voidSale(
+      sale.id,
+      businessId,
+      userId,
+      payload.reason || 'Voided from offline POS'
+    );
 
     return {
       operationId: operation.operationId,
       success: true,
-      serverEntityId: sale.id,
-      serverEntityNumber: sale.saleNumber,
+      serverEntityId: voidedSale.id,
+      serverEntityNumber: voidedSale.saleNumber,
       retryable: false,
     };
   } catch (error) {
